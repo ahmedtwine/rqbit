@@ -1,19 +1,5 @@
 all:
 
-@PHONY: webui-deps
-webui-deps:
-	cd desktop && npm install
-	cd crates/librqbit/webui && npm install
-
-@PHONY: webui-dev
-webui-dev: webui-deps
-	cd crates/librqbit/webui && \
-	npm run dev
-
-@PHONY: webui-build
-webui-build: webui-deps
-	cd crates/librqbit/webui && \
-	npm run build
 
 @PHONY: devserver
 devserver:
@@ -21,6 +7,23 @@ devserver:
 		--log-file /tmp/rqbit-log \
 		--log-file-rust-log=debug,librqbit=trace \
 		server start /tmp/scratch/
+
+@PHONY: webui-deps
+webui-deps:
+	cd desktop && npm install
+	cd crates/librqbit/webui && npm install
+
+@PHONY: webui-dev
+webui-dev:
+	@make webui-deps &
+	@make devserver &
+	cd crates/librqbit/webui && \
+	npm run dev
+
+@PHONY: webui-build
+webui-build: webui-deps
+	cd crates/librqbit/webui && \
+	npm run build
 
 @PHONY: clean
 clean:
