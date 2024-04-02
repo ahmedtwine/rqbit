@@ -64,6 +64,7 @@ impl HttpApi {
                     "POST /torrents/{index}/start": "Resume torrent",
                     "POST /torrents/{index}/forget": "Forget about the torrent, keep the files",
                     "POST /torrents/{index}/delete": "Forget about the torrent, remove the files",
+                    "POST /torrents/{index}/update_only_files": "Change the selection of files to download. You need to POST json of the following form {\"only_files\": [0, 1, 2]}",
                     "POST /torrents": "Add a torrent here. magnet: or http:// or a local file.",
                     "POST /rust_log": "Set RUST_LOG to this post launch (for debugging)",
                     "GET /web/": "Web UI",
@@ -181,6 +182,21 @@ impl HttpApi {
             state.api_torrent_action_delete(idx).map(axum::Json)
         }
 
+        #[derive(Deserialize)]
+        struct UpdateOnlyFilesRequest {
+            only_files: Vec<usize>,
+        }
+
+        async fn torrent_action_update_only_files(
+            State(state): State<ApiState>,
+            Path(idx): Path<usize>,
+            axum::Json(req): axum::Json<UpdateOnlyFilesRequest>,
+        ) -> Result<impl IntoResponse> {
+            state
+                .api_torrent_action_update_only_files(idx, &req.only_files.into_iter().collect())
+                .map(axum::Json)
+        }
+
         async fn set_rust_log(
             State(state): State<ApiState>,
             new_value: String,
@@ -215,7 +231,11 @@ impl HttpApi {
                 .route("/torrents/:id/pause", post(torrent_action_pause))
                 .route("/torrents/:id/start", post(torrent_action_start))
                 .route("/torrents/:id/forget", post(torrent_action_forget))
-                .route("/torrents/:id/delete", post(torrent_action_delete));
+                .route("/torrents/:id/delete", post(torrent_action_delete))
+                .route(
+                    "/torrents/:id/update_only_files",
+                    post(torrent_action_update_only_files),
+                );
         }
 
         #[cfg(feature = "webui")]

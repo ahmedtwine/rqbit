@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{bail, Context};
-use buffers::{ByteBuf, ByteString};
+use buffers::{ByteBuf, ByteBufOwned};
 use clone_to_owned::CloneToOwned;
 use librqbit_core::{hash_id::Id20, lengths::ChunkInfo, peer_id::try_decode_peer_id};
 use parking_lot::RwLock;
@@ -100,7 +100,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         &self,
         outgoing_chan: tokio::sync::mpsc::UnboundedReceiver<WriterRequest>,
         read_buf: ReadBuf,
-        handshake: Handshake<ByteString>,
+        handshake: Handshake<ByteBufOwned>,
         mut conn: tokio::net::TcpStream,
     ) -> anyhow::Result<()> {
         use tokio::io::AsyncWriteExt;
@@ -220,7 +220,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             .read_write_timeout
             .unwrap_or_else(|| Duration::from_secs(10));
 
-        let extended_handshake: RwLock<Option<ExtendedHandshake<ByteString>>> = RwLock::new(None);
+        let extended_handshake: RwLock<Option<ExtendedHandshake<ByteBufOwned>>> = RwLock::new(None);
         let extended_handshake_ref = &extended_handshake;
         let supports_extended = handshake_supports_extended;
 
@@ -272,8 +272,12 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                             .and_then(|e| e.ut_metadata())
                     })?,
                     WriterRequest::ReadChunkRequest(chunk) => {
+                        #[allow(unused_mut)]
+                        let mut skip_reading_for_e2e_tests = false;
+
                         #[cfg(test)]
                         {
+                            use tracing::warn;
                             // This is poor-mans fault injection for running e2e tests.
                             use crate::tests::test_util::TestPeerMetadata;
                             let tpm = TestPeerMetadata::from_peer_id(self.peer_id);
@@ -286,6 +290,12 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                                 * (tpm.max_random_sleep_ms as f64))
                                 as u64;
                             tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+
+                            if rand::thread_rng().gen_bool(tpm.bad_data_probability()) {
+                                warn!("will NOT actually read the data to simulate a malicious peer that sends garbage");
+                                write_buf.fill(0);
+                                skip_reading_for_e2e_tests = true;
+                            }
                         }
 
                         // this whole section is an optimization
@@ -293,12 +303,14 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                         let preamble_len = serialize_piece_preamble(chunk, &mut write_buf);
                         let full_len = preamble_len + chunk.size as usize;
                         write_buf.resize(full_len, 0);
-                        self.spawner
-                            .spawn_block_in_place(|| {
-                                self.handler
-                                    .read_chunk(chunk, &mut write_buf[preamble_len..])
-                            })
-                            .with_context(|| format!("error reading chunk {chunk:?}"))?;
+                        if !skip_reading_for_e2e_tests {
+                            self.spawner
+                                .spawn_block_in_place(|| {
+                                    self.handler
+                                        .read_chunk(chunk, &mut write_buf[preamble_len..])
+                                })
+                                .with_context(|| format!("error reading chunk {chunk:?}"))?;
+                        }
 
                         uploaded_add = Some(chunk.size);
                         full_len

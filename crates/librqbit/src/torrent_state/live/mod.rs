@@ -57,7 +57,7 @@ use std::{
 
 use anyhow::{bail, Context};
 use backoff::backoff::Backoff;
-use buffers::{ByteBuf, ByteString};
+use buffers::{ByteBuf, ByteBufOwned};
 use clone_to_owned::CloneToOwned;
 use futures::{stream::FuturesUnordered, StreamExt};
 use itertools::Itertools;
@@ -72,7 +72,6 @@ use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use peer_binary_protocol::{
     extended::handshake::ExtendedHandshake, Handshake, Message, MessageOwned, Piece, Request,
 };
-use sha1w::Sha1;
 use tokio::{
     sync::{
         mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
@@ -84,7 +83,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, error_span, info, trace, warn};
 
 use crate::{
-    chunk_tracker::{ChunkMarkingResult, ChunkTracker},
+    chunk_tracker::{ChunkMarkingResult, ChunkTracker, HaveNeededSelected},
     file_ops::FileOps,
     peer_connection::{
         PeerConnection, PeerConnectionHandler, PeerConnectionOptions, WriterRequest,
@@ -130,7 +129,7 @@ fn dummy_file() -> anyhow::Result<std::fs::File> {
 }
 
 fn make_piece_bitfield(lengths: &Lengths) -> BF {
-    BF::from_vec(vec![0; lengths.piece_bitfield_bytes()])
+    BF::from_boxed_slice(vec![0; lengths.piece_bitfield_bytes()].into_boxed_slice())
 }
 
 pub(crate) struct TorrentStateLocked {
@@ -204,9 +203,9 @@ impl TorrentStateLive {
         let down_speed_estimator = SpeedEstimator::new(5);
         let up_speed_estimator = SpeedEstimator::new(5);
 
-        let have_bytes = paused.have_bytes;
-        let needed_bytes = paused.needed_bytes;
-        let total_selected_bytes = paused.chunk_tracker.get_total_selected_bytes();
+        let have_bytes = paused.hns.have_bytes;
+        let needed_bytes = paused.hns.needed_bytes;
+        let total_selected_bytes = paused.hns.selected_bytes;
         let lengths = *paused.chunk_tracker.get_lengths();
 
         let state = Arc::new(TorrentStateLive {
@@ -248,10 +247,8 @@ impl TorrentStateLive {
                         let stats = state.stats_snapshot();
                         let fetched = stats.fetched_bytes;
                         let needed = state.initially_needed();
-                        // fetched can be too high in theory, so for safety make sure that it doesn't wrap around u64.
-                        let remaining = needed
-                            .wrapping_sub(fetched)
-                            .min(needed - stats.downloaded_and_checked_bytes);
+                        // TODO: this is too coarse.
+                        let remaining = needed - stats.downloaded_and_checked_bytes;
                         state
                             .down_speed_estimator
                             .add_snapshot(fetched, Some(remaining), now);
@@ -485,7 +482,7 @@ impl TorrentStateLive {
         &self.meta
     }
 
-    pub fn info(&self) -> &TorrentMetaV1Info<ByteString> {
+    pub fn info(&self) -> &TorrentMetaV1Info<ByteBufOwned> {
         &self.meta.info
     }
     pub fn info_hash(&self) -> Id20 {
@@ -494,7 +491,7 @@ impl TorrentStateLive {
     pub fn peer_id(&self) -> Id20 {
         self.meta.peer_id
     }
-    pub(crate) fn file_ops(&self) -> FileOps<'_, Sha1> {
+    pub(crate) fn file_ops(&self) -> FileOps<'_> {
         FileOps::new(&self.meta.info, &self.files, &self.lengths)
     }
     pub fn initially_needed(&self) -> u64 {
@@ -650,6 +647,9 @@ impl TorrentStateLive {
 
         let mut g = self.locked.write();
 
+        // It should be impossible to make a fatal error after pausing.
+        g.fatal_errors_tx.take();
+
         let files = self
             .files
             .iter()
@@ -679,8 +679,11 @@ impl TorrentStateLive {
             files,
             filenames,
             chunk_tracker,
-            have_bytes,
-            needed_bytes,
+            hns: HaveNeededSelected {
+                have_bytes,
+                needed_bytes,
+                selected_bytes: self.total_selected_bytes,
+            },
         })
     }
 
@@ -919,7 +922,7 @@ impl PeerHandler {
                 let n = {
                     let mut n_opt = None;
                     let bf = &live.bitfield;
-                    for n in g.get_chunks()?.iter_needed_pieces() {
+                    for n in g.get_chunks()?.iter_queued_pieces() {
                         if bf.get(n).map(|v| *v) == Some(true) {
                             n_opt = Some(n);
                             break;
@@ -992,6 +995,7 @@ impl PeerHandler {
                 );
             }
         };
+
         let chunk_info = match self.state.lengths.chunk_info_from_received_data(
             piece_index,
             request.begin,
@@ -1047,7 +1051,7 @@ impl PeerHandler {
         self.on_bitfield_notify.notify_waiters();
     }
 
-    fn on_bitfield(&self, bitfield: ByteString) -> anyhow::Result<()> {
+    fn on_bitfield(&self, bitfield: ByteBufOwned) -> anyhow::Result<()> {
         if bitfield.len() != self.state.lengths.piece_bitfield_bytes() {
             anyhow::bail!(
                 "dropping peer as its bitfield has unexpected size. Got {}, expected {}",
@@ -1227,8 +1231,13 @@ impl PeerHandler {
     }
 
     fn on_received_piece(&self, piece: Piece<ByteBuf>) -> anyhow::Result<()> {
-        let chunk_info = match self.state.lengths.chunk_info_from_received_piece(
-            piece.index,
+        let piece_index = self
+            .state
+            .lengths
+            .validate_piece_index(piece.index)
+            .with_context(|| format!("peer sent an invalid piece {}", piece.index))?;
+        let chunk_info = match self.state.lengths.chunk_info_from_received_data(
+            piece_index,
             piece.begin,
             piece.block.len() as u32,
         ) {
@@ -1399,11 +1408,15 @@ impl PeerHandler {
                         self.state.maybe_transmit_haves(chunk_info.piece_index);
                     }
                     false => {
-                        warn!("checksum for piece={} did not validate", index,);
+                        warn!(
+                            "checksum for piece={} did not validate. disconecting peer.",
+                            index
+                        );
                         self.state
                             .lock_write("mark_piece_broken")
                             .get_chunks_mut()?
                             .mark_piece_broken_if_not_have(chunk_info.piece_index);
+                        anyhow::bail!("i am probably a bogus peer. dying.")
                     }
                 };
                 Ok::<_, anyhow::Error>(())

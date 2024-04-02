@@ -1,11 +1,11 @@
 use std::net::SocketAddr;
 
 use bencode::from_bytes;
-use buffers::{ByteBuf, ByteString};
+use buffers::{ByteBuf, ByteBufOwned};
 use librqbit_core::{
     constants::CHUNK_SIZE,
     hash_id::Id20,
-    lengths::{ceil_div_u64, last_element_size_u64, ChunkInfo},
+    lengths::{last_element_size, ChunkInfo},
     torrent_metainfo::TorrentMetaV1Info,
 };
 use parking_lot::{Mutex, RwLock};
@@ -30,9 +30,9 @@ pub(crate) async fn read_metainfo_from_peer(
     info_hash: Id20,
     peer_connection_options: Option<PeerConnectionOptions>,
     spawner: BlockingSpawner,
-) -> anyhow::Result<TorrentMetaV1Info<ByteString>> {
+) -> anyhow::Result<TorrentMetaV1Info<ByteBufOwned>> {
     let (result_tx, result_rx) =
-        tokio::sync::oneshot::channel::<anyhow::Result<TorrentMetaV1Info<ByteString>>>();
+        tokio::sync::oneshot::channel::<anyhow::Result<TorrentMetaV1Info<ByteBufOwned>>>();
     let (writer_tx, writer_rx) = tokio::sync::mpsc::unbounded_channel::<WriterRequest>();
     let handler = Handler {
         addr,
@@ -76,7 +76,7 @@ impl HandlerLocked {
             anyhow::bail!("metadata size {} is too big", metadata_size);
         }
         let buffer = vec![0u8; metadata_size as usize];
-        let total_pieces = ceil_div_u64(metadata_size as u64, CHUNK_SIZE as u64);
+        let total_pieces = (metadata_size as u64).div_ceil(CHUNK_SIZE as u64);
         let received_pieces = vec![false; total_pieces as usize];
         Ok(Self {
             metadata_size,
@@ -87,7 +87,7 @@ impl HandlerLocked {
     }
     fn piece_size(&self, index: u32) -> usize {
         if index as usize == self.total_pieces - 1 {
-            last_element_size_u64(self.metadata_size as u64, CHUNK_SIZE as u64) as usize
+            last_element_size(self.metadata_size as u64, CHUNK_SIZE as u64) as usize
         } else {
             CHUNK_SIZE as usize
         }
@@ -131,8 +131,9 @@ struct Handler {
     addr: SocketAddr,
     info_hash: Id20,
     writer_tx: UnboundedSender<WriterRequest>,
-    result_tx:
-        Mutex<Option<tokio::sync::oneshot::Sender<anyhow::Result<TorrentMetaV1Info<ByteString>>>>>,
+    result_tx: Mutex<
+        Option<tokio::sync::oneshot::Sender<anyhow::Result<TorrentMetaV1Info<ByteBufOwned>>>>,
+    >,
     locked: RwLock<Option<HandlerLocked>>,
 }
 
@@ -169,7 +170,7 @@ impl PeerConnectionHandler for Handler {
                     .record_piece(piece, &data, self.info_hash)?;
             if piece_ready {
                 let buf = self.locked.write().take().unwrap().buffer;
-                let info = from_bytes::<TorrentMetaV1Info<ByteString>>(&buf);
+                let info = from_bytes::<TorrentMetaV1Info<ByteBufOwned>>(&buf);
                 self.result_tx
                     .lock()
                     .take()

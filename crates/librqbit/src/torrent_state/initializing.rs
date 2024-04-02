@@ -8,11 +8,13 @@ use anyhow::Context;
 
 use parking_lot::Mutex;
 
-use sha1w::Sha1;
 use size_format::SizeFormatterBinary as SF;
 use tracing::{debug, info, warn};
 
-use crate::{chunk_tracker::ChunkTracker, file_ops::FileOps};
+use crate::{
+    chunk_tracker::{ChunkTracker, HaveNeededSelected},
+    file_ops::FileOps,
+};
 
 use super::{paused::TorrentStatePaused, ManagedTorrentInfo};
 
@@ -81,7 +83,7 @@ impl TorrentStateInitializing {
 
         info!("Doing initial checksum validation, this might take a while...");
         let initial_check_results = self.meta.spawner.spawn_block_in_place(|| {
-            FileOps::<Sha1>::new(&self.meta.info, &files, &self.meta.lengths)
+            FileOps::new(&self.meta.info, &files, &self.meta.lengths)
                 .initial_check(self.only_files.as_deref(), &self.checked_bytes)
         })?;
 
@@ -89,7 +91,7 @@ impl TorrentStateInitializing {
             "Initial check results: have {}, needed {}, total selected {}",
             SF::new(initial_check_results.have_bytes),
             SF::new(initial_check_results.needed_bytes),
-            SF::new(initial_check_results.total_selected_bytes)
+            SF::new(initial_check_results.selected_bytes)
         );
 
         self.meta.spawner.spawn_block_in_place(|| {
@@ -124,19 +126,22 @@ impl TorrentStateInitializing {
         });
 
         let chunk_tracker = ChunkTracker::new(
-            initial_check_results.needed_pieces,
             initial_check_results.have_pieces,
+            initial_check_results.selected_pieces,
             self.meta.lengths,
-            initial_check_results.total_selected_bytes,
-        );
+        )
+        .context("error creating chunk tracker")?;
 
         let paused = TorrentStatePaused {
             info: self.meta.clone(),
             files,
             filenames,
             chunk_tracker,
-            have_bytes: initial_check_results.have_bytes,
-            needed_bytes: initial_check_results.needed_bytes,
+            hns: HaveNeededSelected {
+                have_bytes: initial_check_results.have_bytes,
+                needed_bytes: initial_check_results.needed_bytes,
+                selected_bytes: initial_check_results.selected_bytes,
+            },
         };
         Ok(paused)
     }

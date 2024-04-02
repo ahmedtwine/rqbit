@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use anyhow::bail;
 use anyhow::Context;
-use buffers::ByteString;
+use buffers::ByteBufOwned;
 use futures::future::BoxFuture;
 use futures::FutureExt;
 use librqbit_core::hash_id::Id20;
@@ -67,6 +67,7 @@ impl ManagedTorrentState {
 
 pub(crate) struct ManagedTorrentLocked {
     pub state: ManagedTorrentState,
+    pub(crate) only_files: Option<Vec<usize>>,
 }
 
 #[derive(Default)]
@@ -78,7 +79,7 @@ pub(crate) struct ManagedTorrentOptions {
 }
 
 pub struct ManagedTorrentInfo {
-    pub info: TorrentMetaV1Info<ByteString>,
+    pub info: TorrentMetaV1Info<ByteBufOwned>,
     pub info_hash: Id20,
     pub out_dir: PathBuf,
     pub(crate) spawner: BlockingSpawner,
@@ -91,7 +92,6 @@ pub struct ManagedTorrentInfo {
 
 pub struct ManagedTorrent {
     pub info: Arc<ManagedTorrentInfo>,
-    pub(crate) only_files: Option<Vec<usize>>,
     locked: RwLock<ManagedTorrentLocked>,
 }
 
@@ -109,7 +109,7 @@ impl ManagedTorrent {
     }
 
     pub fn only_files(&self) -> Option<Vec<usize>> {
-        self.only_files.clone()
+        self.locked.read().only_files.clone()
     }
 
     pub fn with_state<R>(&self, f: impl FnOnce(&ManagedTorrentState) -> R) -> R {
@@ -298,7 +298,7 @@ impl ManagedTorrent {
             ManagedTorrentState::Error(_) => {
                 let initializing = Arc::new(TorrentStateInitializing::new(
                     self.info.clone(),
-                    self.only_files.clone(),
+                    g.only_files.clone(),
                 ));
                 g.state = ManagedTorrentState::Initializing(initializing.clone());
                 drop(g);
@@ -353,9 +353,9 @@ impl ManagedTorrent {
                 }
                 ManagedTorrentState::Paused(p) => {
                     resp.state = S::Paused;
-                    resp.total_bytes = p.chunk_tracker.get_total_selected_bytes();
-                    resp.progress_bytes = resp.total_bytes - p.needed_bytes;
-                    resp.finished = resp.progress_bytes == resp.total_bytes;
+                    resp.total_bytes = p.hns.total();
+                    resp.progress_bytes = p.hns.progress();
+                    resp.finished = p.hns.finished();
                 }
                 ManagedTorrentState::Live(l) => {
                     resp.state = S::Live;
@@ -407,10 +407,49 @@ impl ManagedTorrent {
         }
         .boxed()
     }
+
+    // Returns true if needed to unpause torrent.
+    // This is just implementation detail - it's easier to pause/unpause than to tinker with internals.
+    pub(crate) fn update_only_files(&self, only_files: &HashSet<usize>) -> anyhow::Result<bool> {
+        if only_files.is_empty() {
+            anyhow::bail!("you need to select at least one file");
+        }
+        let file_count = self.info().info.iter_file_lengths()?.count();
+        for f in only_files.iter().copied() {
+            if f >= file_count {
+                anyhow::bail!("only_files contains invalid value {f}")
+            }
+        }
+
+        // if live, need to update chunk tracker
+        // - if already finished: need to pause, then unpause (to reopen files etc)
+        // if paused, need to update chunk tracker
+
+        let mut g = self.locked.write();
+        let need_to_unpause = match &mut g.state {
+            ManagedTorrentState::Initializing(_) => bail!("can't update initializing torrent"),
+            ManagedTorrentState::Error(_) => false,
+            ManagedTorrentState::None => false,
+            ManagedTorrentState::Paused(p) => {
+                p.update_only_files(only_files)?;
+                false
+            }
+            ManagedTorrentState::Live(l) => {
+                let mut p = l.pause()?;
+                let e = p.update_only_files(only_files);
+                g.state = ManagedTorrentState::Paused(p);
+                e?;
+                true
+            }
+        };
+
+        g.only_files = Some(only_files.iter().copied().collect());
+        Ok(need_to_unpause)
+    }
 }
 
 pub struct ManagedTorrentBuilder {
-    info: TorrentMetaV1Info<ByteString>,
+    info: TorrentMetaV1Info<ByteBufOwned>,
     info_hash: Id20,
     output_folder: PathBuf,
     force_tracker_interval: Option<Duration>,
@@ -425,7 +464,7 @@ pub struct ManagedTorrentBuilder {
 
 impl ManagedTorrentBuilder {
     pub fn new<P: AsRef<Path>>(
-        info: TorrentMetaV1Info<ByteString>,
+        info: TorrentMetaV1Info<ByteBufOwned>,
         info_hash: Id20,
         output_folder: P,
     ) -> Self {
@@ -507,9 +546,9 @@ impl ManagedTorrentBuilder {
             self.only_files.clone(),
         ));
         Ok(Arc::new(ManagedTorrent {
-            only_files: self.only_files,
             locked: RwLock::new(ManagedTorrentLocked {
                 state: ManagedTorrentState::Initializing(initializing),
+                only_files: self.only_files,
             }),
             info,
         }))
