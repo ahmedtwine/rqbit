@@ -15,7 +15,7 @@ use peer_binary_protocol::{
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use tokio::time::timeout;
-use tracing::trace;
+use tracing::{info, trace};
 
 use crate::{read_buf::ReadBuf, spawn_utils::BlockingSpawner};
 
@@ -84,6 +84,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         options: Option<PeerConnectionOptions>,
         spawner: BlockingSpawner,
     ) -> Self {
+        info!("new PeerConnection: addr={:?}", addr);
         PeerConnection {
             handler,
             addr,
