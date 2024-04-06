@@ -21,6 +21,7 @@
 //!
 //! It also proved useful to use the [`Api`] when building the rqbit desktop app, as it provides
 //! a facade that works with simple serializable types.
+//!
 
 pub mod api;
 mod api_error;
@@ -30,6 +31,7 @@ mod dht_utils;
 mod file_ops;
 pub mod http_api;
 pub mod http_api_client;
+mod opened_file;
 mod peer_connection;
 mod peer_info_reader;
 mod read_buf;
