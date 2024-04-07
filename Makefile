@@ -1,5 +1,10 @@
 all:
 
+@PHONY: test-torrent-download
+test-torrent-download:
+	rm -rf /tmp/scratch
+	mkdir -p /tmp/scratch
+	cargo run download sample.torrent -o /tmp/scratch
 
 @PHONY: devserver
 devserver:
