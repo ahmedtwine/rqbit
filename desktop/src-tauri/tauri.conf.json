@@ -10,7 +10,7 @@
   },
   "tauri": {
     "allowlist": {
-      "all": false,
+      "all": true,
       "shell": {
         "all": false,
         "open": true
@@ -29,7 +29,7 @@
       ]
     },
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; media-src 'self' blob:; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;"
     },
     "windows": [
       {

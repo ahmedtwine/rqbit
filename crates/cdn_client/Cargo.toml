@@ -8,5 +8,6 @@ aws-config = "1.1.9"
 aws-sdk-s3 = "1.21.0"
 futures = "0.3.30"
 sqlx = "0.7.4"
+tauri = "1.6.1"
 tokio = { version = "1.37.0", features = ["full"] }
 tokio-stream = { version = "0.1.15", features = ["full"] }

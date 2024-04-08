@@ -22,6 +22,7 @@ use librqbit::{
     tracing_subscriber_config_utils::{init_logging, InitLoggingOptions, InitLoggingResult},
     AddTorrent, AddTorrentOptions, Api, ApiError, PeerConnectionOptions, Session, SessionOptions,
 };
+use cdn_client;
 use parking_lot::RwLock;
 use serde::Serialize;
 use tracing::{error, error_span, info, warn};
@@ -307,6 +308,14 @@ async fn torrent_action_configure(
 #[tauri::command]
 fn get_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+#[tauri::command]
+pub async fn download_s3_video(window: tauri::Window) -> () {
+    let (client, bucket_name) = cdn_client::get_aws_client_bucket().await;
+    cdn_client::download_object(&client, bucket_name, "file_example_MP4_480_1_5MG.mp4", window)
+        .await
+        .unwrap();
 }
 
 async fn start() {

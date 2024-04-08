@@ -10,6 +10,7 @@ import { Header } from "./components/Header";
 import { DarkMode } from "./helper/darkMode";
 import { useTorrentStore } from "./stores/torrentStore";
 import { useErrorStore } from "./stores/errorStore";
+import VideoPlayer from "../../../../desktop/src/components/VideoPlayer";
 
 export interface ErrorWithLabel {
   text: string;
@@ -28,24 +29,23 @@ export const RqbitWebUI = (props: {
 }) => {
   let [logsOpened, setLogsOpened] = useState<boolean>(false);
   const setOtherError = useErrorStore((state) => state.setOtherError);
-
   const API = useContext(APIContext);
-
   const setTorrents = useTorrentStore((state) => state.setTorrents);
   const setTorrentsLoading = useTorrentStore(
-    (state) => state.setTorrentsLoading,
+    (state) => state.setTorrentsLoading
   );
   const setRefreshTorrents = useTorrentStore(
-    (state) => state.setRefreshTorrents,
+    (state) => state.setRefreshTorrents
   );
 
   const refreshTorrents = async () => {
     setTorrentsLoading(true);
     let torrents = await API.listTorrents().finally(() =>
-      setTorrentsLoading(false),
+      setTorrentsLoading(false)
     );
     setTorrents(torrents.torrents);
   };
+
   setRefreshTorrents(refreshTorrents);
 
   useEffect(() => {
@@ -60,9 +60,9 @@ export const RqbitWebUI = (props: {
             setOtherError({ text: "Error refreshing torrents", details: e });
             console.error(e);
             return 5000;
-          },
+          }
         ),
-      0,
+      0
     );
   }, []);
 
@@ -81,11 +81,15 @@ export const RqbitWebUI = (props: {
             <BsMoon />
           </IconButton>
         </div>
-
         <RootContent />
       </div>
-
       <LogStreamModal show={logsOpened} onClose={() => setLogsOpened(false)} />
+      <div className="mt-8 flex flex-col items-center">
+        <h3 className="text-lg font-semibold mb-4">Video Player</h3>
+        <div className="video-player-container w-full max-w-4xl rounded-lg overflow-hidden shadow-lg">
+          <VideoPlayer />
+        </div>
+      </div>
     </div>
   );
 };
