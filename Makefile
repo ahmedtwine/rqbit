@@ -1,5 +1,9 @@
 all:
 
+@PHONY: run-cdn-client
+run-cdn-client:
+	cargo run -p cdn_client
+
 @PHONY: test-torrent-download
 test-torrent-download:
 	rm -rf /tmp/scratch
