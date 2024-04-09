@@ -37,7 +37,7 @@ mod peer_info_reader;
 mod read_buf;
 mod session;
 mod spawn_utils;
-mod torrent_state;
+pub mod torrent_state;
 pub mod tracing_subscriber_config_utils;
 mod type_aliases;
 

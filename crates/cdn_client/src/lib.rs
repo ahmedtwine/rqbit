@@ -1,4 +1,5 @@
 // Declare the s3_client module
+pub mod client;
 pub mod s3_client;
 
 // Re-export the download_s3_video function
