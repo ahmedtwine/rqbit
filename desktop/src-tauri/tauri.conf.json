@@ -11,6 +11,10 @@
   "tauri": {
     "allowlist": {
       "all": true,
+      "window": {
+        "all": true,
+        "create": true
+      },
       "shell": {
         "all": false,
         "open": true

@@ -1,6 +1,7 @@
 import React, { useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/tauri";
 import { listen } from "@tauri-apps/api/event";
+import { invokeAPI } from "../api";
 
 const VideoPlayer: React.FC = () => {
   console.log("VideoPlayer");
@@ -33,7 +34,7 @@ const VideoPlayer: React.FC = () => {
     };
 
     const unlisten = listen("video-chunk", handleVideoChunk);
-    invoke("download_s3_video");
+    invokeAPI("download_s3_video");
 
     return () => {
       unlisten.then((f) => f());

@@ -8,7 +8,7 @@ pub async fn download_object(
     client: &Client,
     bucket_name: &str,
     key: &str,
-    window: tauri::Window,
+    window: Option<tauri::Window>,
 ) -> Result<(), SdkError<GetObjectError>> {
     let mut stream = client
         .get_object()
@@ -21,7 +21,10 @@ pub async fn download_object(
 
     let mut buffer = Vec::new();
     while stream.read_buf(&mut buffer).await.unwrap() != 0 {
-        window.emit("video-chunk", buffer.clone()).unwrap();
+        println!("Read {} bytes", buffer.len());
+        if let Some(window) = window.as_ref() {
+            window.emit("video-chink", buffer.clone()).unwrap();
+        }
         buffer.clear();
     }
 

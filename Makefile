@@ -2,8 +2,10 @@ all:
 
 @PHONY: run-cdn-client
 # Need to change lib.rs to main.rs in order to run the binary
-run-cdn-client: 
-	cargo run -p cdn_client
+run-cdn-client:
+	cp crates/cdn_client/src/lib.rs crates/cdn_client/src/main.rs || true
+	cargo run -p cdn_client || true
+	rm crates/cdn_client/src/main.rs
 
 @PHONY: test-torrent-download
 test-torrent-download:
