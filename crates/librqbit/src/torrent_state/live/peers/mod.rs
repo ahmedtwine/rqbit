@@ -3,8 +3,11 @@ use std::net::SocketAddr;
 use anyhow::Context;
 use backoff::backoff::Backoff;
 use dashmap::DashMap;
+use librqbit_core::lengths::ValidPieceIndex;
+use peer_binary_protocol::{Message, Request};
 
 use crate::{
+    peer_connection::WriterRequest,
     torrent_state::utils::{atomic_inc, TimedExistence},
     type_aliases::{PeerHandle, BF},
 };
@@ -108,5 +111,39 @@ impl PeerStates {
             peer.state.set_not_needed(&self.stats)
         })?;
         Some(prev)
+    }
+
+    pub(crate) fn on_steal(
+        &self,
+        from_peer: SocketAddr,
+        to_peer: SocketAddr,
+        stolen_idx: ValidPieceIndex,
+    ) {
+        self.with_peer(to_peer, |p| {
+            atomic_inc(&p.stats.counters.times_i_stole);
+        });
+        self.with_peer(from_peer, |p| {
+            atomic_inc(&p.stats.counters.times_stolen_from_me);
+        });
+        self.stats.inc_steals();
+
+        self.with_live_mut(from_peer, "send_cancellations", |live| {
+            let to_remove = live
+                .inflight_requests
+                .iter()
+                .filter(|r| r.piece_index == stolen_idx)
+                .copied()
+                .collect::<Vec<_>>();
+            for req in to_remove {
+                let _ = live
+                    .tx
+                    .send(WriterRequest::Message(Message::Cancel(Request {
+                        index: stolen_idx.get(),
+                        begin: req.offset,
+                        length: req.size,
+                    })));
+                live.inflight_requests.remove(&req);
+            }
+        });
     }
 }
