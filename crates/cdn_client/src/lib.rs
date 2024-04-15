@@ -8,9 +8,15 @@ pub use s3_client::get_aws_client_bucket;
 
 #[tokio::main]
 async fn main() {
-    let (client, bucket_name) = get_aws_client_bucket().await;
-    download_object(&client, bucket_name, "file_example_MP4_480_1_5MG.mp4", None)
-        .await
-        .unwrap();
-    println!("Bucket Name: {:?}", bucket_name);
+    // let (client, bucket_name) = get_aws_client_bucket().await;
+    // download_object(&client, bucket_name, "file_example_MP4_480_1_5MG.mp4", None)
+    //     .await
+    //     .unwrap();
+
+    s3_client::download_stream_public_url(
+        "https://bacbone-assets.s3.us-west-2.amazonaws.com/file_example_MP4_480_1_5MG.mp4",
+        "file_output.mp4",
+    )
+    .await
+    .unwrap();
 }

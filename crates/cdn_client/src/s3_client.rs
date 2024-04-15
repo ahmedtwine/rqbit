@@ -1,8 +1,50 @@
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::{error::SdkError, Client};
+use reqwest;
 use std::str;
-use tokio::io::AsyncReadExt;
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex;
+
+pub async fn download_stream_public_url(url: &str, file_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let client = reqwest::Client::new();
+    let parts = 4; // Number of concurrent requests
+    let mut handles = vec![];
+    let file = Arc::new(Mutex::new(tokio::fs::File::create(file_path).await?));
+
+    for part in 0..parts {
+        let client = client.clone();
+        let file = Arc::clone(&file);
+        let url = url.to_string();
+        let handle = tokio::spawn(async move {
+            let start_byte = part * (1_500_000 / parts);
+            let end_byte = ((part + 1) * (1_500_000 / parts)) - 1;
+            let range_header_value = format!("bytes={}-{}", start_byte, end_byte);
+
+            let response = client
+                .get(&url)
+                .header("Range", range_header_value)
+                .send()
+                .await
+                .unwrap();
+
+            let mut buffer = Vec::new();
+            buffer.extend_from_slice(&response.bytes().await.unwrap());
+
+            let mut file = file.lock().await;
+            file.write_all(&buffer).await.unwrap();
+        });
+
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.await?;
+    }
+
+    Ok(())
+}
 
 pub async fn download_object(
     client: &Client,

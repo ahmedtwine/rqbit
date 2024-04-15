@@ -1,3 +1,5 @@
+use super::s3_client;
+use lava_torrent::torrent::v1::TorrentBuilder;
 use librqbit::{torrent_from_bytes, ByteBufOwned, TorrentMetaV1};
 use librqbit::{
     torrent_state::ManagedTorrentBuilder, AddTorrent, AddTorrentOptions, AddTorrentResponse,
@@ -21,7 +23,9 @@ struct CdnClient {
     out_dir: PathBuf,
 }
 
-fn generate_torrent(chunks: &[Vec<u8>]) -> TorrentMetaV1<ByteBufOwned> {
+fn generate_torrent(path: &str, piece_langth: i64) -> TorrentMetaV1<ByteBufOwned> {
+    let torrent = TorrentBuilder::new(path, piece_langth).build().unwrap();
+    torrent.write_into_file("sample.torrent").unwrap();
     todo!("generate torrent from chunks")
 }
 
@@ -112,17 +116,15 @@ impl CdnClient {
             }
         }
 
-        // Torrent doesn't exist or has expired, fetch from the upstream CDN
-        let content = download_content(url).await?;
-
-        // Chunk the content into smaller pieces
-        let chunks = content
-            .chunks(chunk_size)
-            .map(|chunk| chunk.to_vec())
-            .collect::<Vec<_>>();
+        s3_client::download_stream_public_url(
+            "https://bacbone-assets.s3.us-west-2.amazonaws.com/file_example_MP4_480_1_5MG.mp4",
+            "file_output.mp4",
+        )
+        .await
+        .unwrap();
 
         // Generate the torrent file from the content chunks
-        let torrent = generate_torrent(&chunks);
+        let torrent = generate_torrent("file_output.mp4", 1_500_000);
         let torrent_file = serde_bencode::to_bytes(&torrent)?;
 
         // Save the torrent to the database
