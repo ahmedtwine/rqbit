@@ -23,14 +23,21 @@ struct CdnClient {
     out_dir: PathBuf,
 }
 
-fn generate_torrent(path: &str, piece_langth: i64) -> TorrentMetaV1<ByteBufOwned> {
-    let torrent = TorrentBuilder::new(path, piece_langth).build().unwrap();
+fn generate_torrent(path: &str, chunk_size: i64) -> TorrentMetaV1<ByteBufOwned> {
+    let torrent = TorrentBuilder::new(path, chunk_size).build().unwrap();
     torrent.write_into_file("sample.torrent").unwrap();
     todo!("generate torrent from chunks")
 }
 
-async fn download_content(_url: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    todo!()
+async fn download_content(
+    _url: &str,
+    file_save_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    s3_client::download_stream_public_url(
+        "https://bacbone-assets.s3.us-west-2.amazonaws.com/file_example_MP4_480_1_5MG.mp4",
+        file_save_path,
+    )
+    .await
 }
 
 impl CdnClient {
@@ -115,16 +122,10 @@ impl CdnClient {
                 return Ok(());
             }
         }
-
-        s3_client::download_stream_public_url(
-            "https://bacbone-assets.s3.us-west-2.amazonaws.com/file_example_MP4_480_1_5MG.mp4",
-            "file_output.mp4",
-        )
-        .await
-        .unwrap();
+        download_content(url, "file_output.mp4").await?;
 
         // Generate the torrent file from the content chunks
-        let torrent = generate_torrent("file_output.mp4", 1_500_000);
+        let torrent = generate_torrent("file_output.mp4", chunk_size as i64);
         let torrent_file = serde_bencode::to_bytes(&torrent)?;
 
         // Save the torrent to the database
