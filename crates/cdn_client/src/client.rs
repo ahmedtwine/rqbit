@@ -32,7 +32,10 @@ async fn download_content(_url: &str) -> Result<Vec<u8>, Box<dyn std::error::Err
 
 impl CdnClient {
     async fn new(out_dir: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+        // Connect to the SQLite database
         let db = SqlitePool::connect("sqlite:cdn_cache.db").await?;
+
+        // Create the 'torrents' table if it doesn't exist
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS torrents (
                 url TEXT PRIMARY KEY,
@@ -44,6 +47,7 @@ impl CdnClient {
         .execute(&db)
         .await?;
 
+        // Configure session options
         let sopts = SessionOptions {
             disable_dht: false,
             disable_dht_persistence: false,
@@ -60,6 +64,7 @@ impl CdnClient {
             enable_upnp_port_forwarding: true,
         };
 
+        // Create a new session with the specified options
         let session = Session::new_with_opts(PathBuf::from("cdn_cache"), sopts)
             .await
             .map_err(|e| e.to_string())?;
@@ -90,10 +95,17 @@ impl CdnClient {
             if expires_at > chrono::Utc::now().timestamp() {
                 // Torrent exists and hasn't expired, use BitTorrent to fetch the content
                 let torrent = torrent_from_bytes(&torrent_file)?;
-                let torrent_info = torrent.info;
                 let torrent_id = Id20::new([0; 20]); // Replace with actual torrent ID
-                let torrent = ManagedTorrentBuilder::new(torrent_info, torrent_id, &self.out_dir)
-                    .build(Span::current())?;
+
+                // Create a new ManagedTorrentBuilder with the torrent info and output directory
+                let mut builder =
+                    ManagedTorrentBuilder::new(torrent.info, torrent_id, &self.out_dir);
+                builder.overwrite(true);
+
+                // Build the ManagedTorrent instance
+                let torrent = builder.build(Span::current())?;
+
+                // Fetch the content using BitTorrent
                 self.fetch_content_from_torrent(torrent).await?;
                 return Ok(());
             }
@@ -102,13 +114,13 @@ impl CdnClient {
         // Torrent doesn't exist or has expired, fetch from the upstream CDN
         let content = download_content(url).await?;
 
-        // Chunk the content
+        // Chunk the content into smaller pieces
         let chunks = content
             .chunks(chunk_size)
             .map(|chunk| chunk.to_vec())
             .collect::<Vec<_>>();
 
-        // Generate the torrent file
+        // Generate the torrent file from the content chunks
         let torrent = generate_torrent(&chunks);
         let torrent_file = serde_bencode::to_bytes(&torrent)?;
 
@@ -126,8 +138,10 @@ impl CdnClient {
 
         // Fetch the content using BitTorrent
         let torrent_id = Id20::from_str("00000fffffffffffffffffffffffffffffffffff").unwrap(); // Replace with actual torrent ID
-        let torrent = ManagedTorrentBuilder::new(torrent.info, torrent_id, &self.out_dir)
-            .build(Span::current())?;
+        let mut builder = ManagedTorrentBuilder::new(torrent, torrent_id, &self.out_dir);
+        builder.overwrite(true);
+        let torrent = builder.build(Span::current())?;
+
         self.fetch_content_from_torrent(torrent).await?;
 
         Ok(())
@@ -137,6 +151,7 @@ impl CdnClient {
         &self,
         torrent: Arc<ManagedTorrent>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // Add the torrent to the session
         let handle = self
             .session
             .add_torrent(
@@ -150,6 +165,7 @@ impl CdnClient {
 
         match handle {
             AddTorrentResponse::Added(_, handle) => {
+                // Wait until the torrent download is completed
                 handle.wait_until_completed().await?;
                 Ok(())
             }
@@ -162,6 +178,7 @@ impl CdnClient {
         let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
 
         loop {
+            // Accept incoming connections from the tracker
             let (mut socket, _) = listener.accept().await?;
             let db = self.db.clone();
 

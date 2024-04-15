@@ -520,7 +520,7 @@ impl ManagedTorrentBuilder {
         self
     }
 
-    pub(crate) fn build(self, span: tracing::Span) -> anyhow::Result<ManagedTorrentHandle> {
+    pub fn build(self, span: tracing::Span) -> anyhow::Result<ManagedTorrentHandle> {
         let lengths = Lengths::from_torrent(&self.info)?;
         let info = Arc::new(ManagedTorrentInfo {
             span,
