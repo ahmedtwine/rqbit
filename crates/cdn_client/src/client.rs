@@ -1,31 +1,37 @@
-use anyhow::Context;
+use librqbit::torrent_from_bytes;
 use librqbit::{
     torrent_state::ManagedTorrentBuilder, AddTorrent, AddTorrentOptions, AddTorrentResponse,
     ManagedTorrent, PeerConnectionOptions, Session, SessionOptions,
 };
-use librqbit_core::torrent_metainfo::{TorrentMetaV1File, TorrentMetaV1Info, TorrentMetaV1Owned};
+use librqbit_core::torrent_metainfo::TorrentMetaV1Info;
+use librqbit_core::Id20;
+use serde_bencode;
+use serde_bytes::ByteBuf;
 use sqlx::sqlite::SqlitePool;
 use sqlx::Row;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
+use tracing::Span;
 
 struct CdnClient {
     db: SqlitePool,
     session: Arc<Session>,
+    out_dir: PathBuf,
 }
 
-fn generate_torrent(chunks: &[Vec<u8>]) -> TorrentMetaV1Info<Vec<u8>> {
+fn generate_torrent(chunks: &[Vec<u8>]) -> TorrentMetaV1Info<ByteBuf> {
     todo!("generate torrent from chunks")
 }
 
-async fn download_content(url: &str) -> () {
+async fn download_content(_url: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     todo!()
 }
 
 impl CdnClient {
-    async fn new() -> Result<Self, Box<dyn std::error::Error>> {
+    async fn new(out_dir: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
         let db = SqlitePool::connect("sqlite:cdn_cache.db").await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS torrents (
@@ -58,7 +64,11 @@ impl CdnClient {
             .await
             .map_err(|e| e.to_string())?;
 
-        Ok(Self { db, session })
+        Ok(Self {
+            db,
+            session,
+            out_dir,
+        })
     }
 
     async fn fetch_content(
@@ -79,11 +89,11 @@ impl CdnClient {
 
             if expires_at > chrono::Utc::now().timestamp() {
                 // Torrent exists and hasn't expired, use BitTorrent to fetch the content
-                let torrent_info =
-                    TorrentMetaV1Info::from_bytes(torrent_file).context("invalid torrent file")?;
-                let torrent = ManagedTorrentBuilder::new(torrent_info, self.session.clone())
-                    .build()
-                    .context("failed to create managed torrent")?;
+                let torrent = torrent_from_bytes(&torrent_file)?;
+                let torrent_info = torrent.info;
+                let torrent_id = Id20::new([0; 20]); // Replace with actual torrent ID
+                let torrent = ManagedTorrentBuilder::new(torrent_info, torrent_id, &self.out_dir)
+                    .build(Span::current())?;
                 self.fetch_content_from_torrent(torrent).await?;
                 return Ok(());
             }
@@ -100,7 +110,7 @@ impl CdnClient {
 
         // Generate the torrent file
         let torrent = generate_torrent(&chunks);
-        let torrent_file = torrent.to_bytes();
+        let torrent_file = serde_bencode::to_bytes(&torrent)?;
 
         // Save the torrent to the database
         sqlx::query(
@@ -115,11 +125,9 @@ impl CdnClient {
         .await?;
 
         // Fetch the content using BitTorrent
-        let torrent_info =
-            TorrentMetaV1Info::from_bytes(torrent_file).context("invalid torrent file")?;
-        let torrent = ManagedTorrentBuilder::new(torrent_info, self.session.clone())
-            .build()
-            .context("failed to create managed torrent")?;
+        let torrent_id = Id20::from_str("00000fffffffffffffffffffffffffffffffffff").unwrap(); // Replace with actual torrent ID
+        let torrent = ManagedTorrentBuilder::new(torrent.info, torrent_id, &self.out_dir)
+            .build(Span::current())?;
         self.fetch_content_from_torrent(torrent).await?;
 
         Ok(())
@@ -132,7 +140,7 @@ impl CdnClient {
         let handle = self
             .session
             .add_torrent(
-                AddTorrent::from_torrent(torrent.info().info.clone()),
+                AddTorrent::from_bytes(serde_bencode::to_bytes(&torrent.info().info)?),
                 Some(AddTorrentOptions {
                     overwrite: true,
                     ..Default::default()
@@ -159,26 +167,35 @@ impl CdnClient {
 
             tokio::spawn(async move {
                 // Read the torrent file from the socket
-                let mut torrent_file = Vec::new();
-                socket.read_to_end(&mut torrent_file).await?;
+                let mut torrent_file = ByteBuf::new();
+                if let Err(e) = socket.read_to_end(&mut torrent_file).await {
+                    eprintln!("Error reading torrent file from socket: {:?}", e);
+                    return;
+                }
 
                 // Parse the torrent file
-                let torrent_info =
-                    TorrentMetaV1Info::from_bytes(torrent_file).context("invalid torrent file")?;
+                let torrent_info = match torrent_from_bytes(&torrent_file) {
+                    Ok(info) => info,
+                    Err(e) => {
+                        eprintln!("Error parsing torrent file: {:?}", e);
+                        return;
+                    }
+                };
 
                 // Save the torrent to the database
-                sqlx::query(
+                if let Err(e) = sqlx::query(
                     "INSERT OR REPLACE INTO torrents (url, torrent_file, created_at, expires_at)
                     VALUES (?, ?, ?, ?)",
                 )
-                .bind(torrent_info.name().to_string())
+                .bind(torrent_info.info_hash.as_string())
                 .bind(&torrent_file)
                 .bind(chrono::Utc::now().timestamp())
                 .bind(chrono::Utc::now().timestamp() + 3600) // Expires in 1 hour
                 .execute(&db)
-                .await?;
-
-                Ok(())
+                .await
+                {
+                    eprintln!("Error saving torrent to database: {:?}", e);
+                }
             });
         }
     }
