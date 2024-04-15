@@ -1,9 +1,8 @@
-use librqbit::torrent_from_bytes;
+use librqbit::{torrent_from_bytes, ByteBufOwned, TorrentMetaV1};
 use librqbit::{
     torrent_state::ManagedTorrentBuilder, AddTorrent, AddTorrentOptions, AddTorrentResponse,
     ManagedTorrent, PeerConnectionOptions, Session, SessionOptions,
 };
-use librqbit_core::torrent_metainfo::TorrentMetaV1Info;
 use librqbit_core::Id20;
 use serde_bencode;
 use serde_bytes::ByteBuf;
@@ -22,7 +21,7 @@ struct CdnClient {
     out_dir: PathBuf,
 }
 
-fn generate_torrent(chunks: &[Vec<u8>]) -> TorrentMetaV1Info<ByteBuf> {
+fn generate_torrent(chunks: &[Vec<u8>]) -> TorrentMetaV1<ByteBufOwned> {
     todo!("generate torrent from chunks")
 }
 
@@ -94,8 +93,10 @@ impl CdnClient {
 
             if expires_at > chrono::Utc::now().timestamp() {
                 // Torrent exists and hasn't expired, use BitTorrent to fetch the content
-                let torrent = torrent_from_bytes(&torrent_file)?;
-                let torrent_id = Id20::new([0; 20]); // Replace with actual torrent ID
+                let torrent: librqbit::TorrentMetaV1<ByteBufOwned> =
+                    torrent_from_bytes(&torrent_file)?;
+                let torrent_id =
+                    Id20::from_str("00000fffffffffffffffffffffffffffffffffff").unwrap(); // Replace with actual torrent ID
 
                 // Create a new ManagedTorrentBuilder with the torrent info and output directory
                 let mut builder =
@@ -138,7 +139,7 @@ impl CdnClient {
 
         // Fetch the content using BitTorrent
         let torrent_id = Id20::from_str("00000fffffffffffffffffffffffffffffffffff").unwrap(); // Replace with actual torrent ID
-        let mut builder = ManagedTorrentBuilder::new(torrent, torrent_id, &self.out_dir);
+        let mut builder = ManagedTorrentBuilder::new(torrent.info, torrent_id, &self.out_dir);
         builder.overwrite(true);
         let torrent = builder.build(Span::current())?;
 
@@ -190,28 +191,24 @@ impl CdnClient {
                     return;
                 }
 
-                // Parse the torrent file
-                let torrent_info = match torrent_from_bytes(&torrent_file) {
-                    Ok(info) => info,
-                    Err(e) => {
-                        eprintln!("Error parsing torrent file: {:?}", e);
-                        return;
-                    }
-                };
+                let torrent: librqbit::TorrentMetaV1<ByteBuf> = torrent_from_bytes(&torrent_file)
+                    .map_err(|e| format!("Error parsing torrent file: {:?}", e))
+                    .unwrap();
 
                 // Save the torrent to the database
                 if let Err(e) = sqlx::query(
                     "INSERT OR REPLACE INTO torrents (url, torrent_file, created_at, expires_at)
                     VALUES (?, ?, ?, ?)",
                 )
-                .bind(torrent_info.info_hash.as_string())
-                .bind(&torrent_file)
+                .bind(torrent.info_hash.as_string())
+                .bind(torrent_file.to_vec())
                 .bind(chrono::Utc::now().timestamp())
                 .bind(chrono::Utc::now().timestamp() + 3600) // Expires in 1 hour
                 .execute(&db)
                 .await
                 {
                     eprintln!("Error saving torrent to database: {:?}", e);
+                    return;
                 }
             });
         }
