@@ -51,7 +51,8 @@ pub(crate) async fn read_metainfo_from_peer(
     );
 
     let result_reader = async move { result_rx.await? };
-    let connection_runner = async move { connection.manage_peer_outgoing(writer_rx).await };
+    let (_, brx) = tokio::sync::broadcast::channel(1);
+    let connection_runner = async move { connection.manage_peer_outgoing(writer_rx, brx).await };
 
     tokio::select! {
         result = result_reader => result,
@@ -76,18 +77,22 @@ impl HandlerLocked {
             anyhow::bail!("metadata size {} is too big", metadata_size);
         }
         let buffer = vec![0u8; metadata_size as usize];
-        let total_pieces = (metadata_size as u64).div_ceil(CHUNK_SIZE as u64);
-        let received_pieces = vec![false; total_pieces as usize];
+        let total_pieces: usize = (metadata_size as u64)
+            .div_ceil(CHUNK_SIZE as u64)
+            .try_into()?;
+        let received_pieces = vec![false; total_pieces];
         Ok(Self {
             metadata_size,
             received_pieces,
             buffer,
-            total_pieces: total_pieces as usize,
+            total_pieces,
         })
     }
     fn piece_size(&self, index: u32) -> usize {
         if index as usize == self.total_pieces - 1 {
-            last_element_size(self.metadata_size as u64, CHUNK_SIZE as u64) as usize
+            last_element_size(self.metadata_size as u64, CHUNK_SIZE as u64)
+                .try_into()
+                .unwrap()
         } else {
             CHUNK_SIZE as usize
         }
@@ -153,7 +158,7 @@ impl PeerConnectionHandler for Handler {
         Ok(())
     }
 
-    fn on_received_message(&self, msg: Message<ByteBuf<'_>>) -> anyhow::Result<()> {
+    async fn on_received_message(&self, msg: Message<ByteBuf<'_>>) -> anyhow::Result<()> {
         trace!("{}: received message: {:?}", self.addr, msg);
 
         if let Message::Extended(ExtendedMessage::UtMetadata(UtMetadata::Data {
@@ -216,10 +221,14 @@ impl PeerConnectionHandler for Handler {
         for i in 0..total_pieces {
             self.writer_tx
                 .send(WriterRequest::Message(Message::Extended(
-                    ExtendedMessage::UtMetadata(UtMetadata::Request(i as u32)),
+                    ExtendedMessage::UtMetadata(UtMetadata::Request(i.try_into()?)),
                 )))?;
         }
         Ok(())
+    }
+
+    fn should_transmit_have(&self, _id: librqbit_core::lengths::ValidPieceIndex) -> bool {
+        false
     }
 }
 

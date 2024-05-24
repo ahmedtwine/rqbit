@@ -1,4 +1,5 @@
 use std::{
+    any::TypeId,
     borrow::Cow,
     collections::{HashMap, HashSet},
     io::{BufReader, BufWriter, Read},
@@ -11,13 +12,15 @@ use std::{
 
 use crate::{
     dht_utils::{read_metainfo_from_peer_receiver, ReadMetainfoResult},
+    merge_streams::merge_streams,
     peer_connection::PeerConnectionOptions,
     read_buf::ReadBuf,
     spawn_utils::BlockingSpawner,
+    storage::{filesystem::FilesystemStorageFactory, BoxStorageFactory, StorageFactoryExt},
     torrent_state::{
         ManagedTorrentBuilder, ManagedTorrentHandle, ManagedTorrentState, TorrentStateLive,
     },
-    type_aliases::PeerStream,
+    type_aliases::{DiskWorkQueueSender, PeerStream},
 };
 use anyhow::{bail, Context};
 use bencode::{bencode_serialize_to_writer, BencodeDeserializer};
@@ -31,6 +34,7 @@ use futures::{
 };
 use itertools::Itertools;
 use librqbit_core::{
+    constants::CHUNK_SIZE,
     directories::get_configuration_directory,
     magnet::Magnet,
     peer_id::generate_peer_id,
@@ -42,7 +46,6 @@ use librqbit_core::{
 use parking_lot::RwLock;
 use peer_binary_protocol::Handshake;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_with::serde_as;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_stream::StreamExt;
 use tokio_util::sync::{CancellationToken, DropGuard};
@@ -95,6 +98,12 @@ impl SessionDatabase {
             torrents: self
                 .torrents
                 .iter()
+                // We don't support serializing / deserializing of other storage types.
+                .filter(|(_, torrent)| {
+                    torrent
+                        .storage_factory
+                        .is_type_id(TypeId::of::<FilesystemStorageFactory>())
+                })
                 .map(|(id, torrent)| {
                     (
                         *id,
@@ -110,7 +119,7 @@ impl SessionDatabase {
                             only_files: torrent.only_files().clone(),
                             is_paused: torrent
                                 .with_state(|s| matches!(s, ManagedTorrentState::Paused(_))),
-                            output_folder: torrent.info().out_dir.clone(),
+                            output_folder: torrent.info().options.output_folder.clone(),
                         },
                     )
                 })
@@ -179,6 +188,10 @@ pub struct Session {
     tcp_listen_port: Option<u16>,
 
     cancellation_token: CancellationToken,
+
+    disk_write_tx: Option<DiskWorkQueueSender>,
+
+    default_storage_factory: Option<BoxStorageFactory>,
 
     // This is stored for all tasks to stop when session is dropped.
     _cancellation_token_drop_guard: DropGuard,
@@ -254,21 +267,21 @@ fn compute_only_files(
 }
 
 fn merge_two_optional_streams<T>(
-    s1: Option<impl Stream<Item = T> + Send + 'static>,
-    s2: Option<impl Stream<Item = T> + Send + 'static>,
+    s1: Option<impl Stream<Item = T> + Unpin + Send + 'static>,
+    s2: Option<impl Stream<Item = T> + Unpin + Send + 'static>,
 ) -> Option<BoxStream<'static, T>> {
     match (s1, s2) {
         (Some(s1), None) => Some(Box::pin(s1)),
         (None, Some(s2)) => Some(Box::pin(s2)),
-        (Some(s1), Some(s2)) => Some(Box::pin(s1.chain(s2))),
+        (Some(s1), Some(s2)) => Some(Box::pin(merge_streams(s1, s2))),
         (None, None) => None,
     }
 }
 
 /// Options for adding new torrents to the session.
-#[serde_as]
-#[derive(Default, Clone, Serialize, Deserialize)]
-#[serde(default)]
+//
+// Serialize/deserialize is for Tauri.
+#[derive(Default, Serialize, Deserialize)]
 pub struct AddTorrentOptions {
     /// Start in paused state.
     pub paused: bool,
@@ -291,7 +304,6 @@ pub struct AddTorrentOptions {
     pub peer_opts: Option<PeerConnectionOptions>,
 
     /// Force a refresh interval for polling trackers.
-    #[serde_as(as = "Option<serde_with::DurationSeconds>")]
     pub force_tracker_interval: Option<Duration>,
 
     pub disable_trackers: bool,
@@ -300,8 +312,14 @@ pub struct AddTorrentOptions {
     pub initial_peers: Option<Vec<SocketAddr>>,
 
     /// This is used to restore the session from serialized state.
-    #[serde(skip)]
     pub preferred_id: Option<usize>,
+
+    #[serde(skip)]
+    pub storage_factory: Option<BoxStorageFactory>,
+
+    // If true, will write to disk in separate threads. The downside is additional allocations.
+    // May be useful if the disk is slow.
+    pub defer_writes: Option<bool>,
 }
 
 pub struct ListOnlyResponse {
@@ -409,6 +427,12 @@ pub struct SessionOptions {
 
     pub listen_port_range: Option<std::ops::Range<u16>>,
     pub enable_upnp_port_forwarding: bool,
+
+    // If you set this to something, all writes to disk will happen in background and be
+    // buffered in memory up to approximately the given number of megabytes.
+    pub defer_writes_up_to: Option<usize>,
+
+    pub default_storage_factory: Option<BoxStorageFactory>,
 }
 
 async fn create_tcp_listener(
@@ -433,10 +457,12 @@ pub(crate) struct CheckedIncomingConnection {
 }
 
 impl Session {
-    /// Create a new session. The passed in folder will be used as a default unless overriden per torrent.
+    /// Create a new session with default options.
+    /// The passed in folder will be used as a default unless overriden per torrent.
+    /// It will run a DHT server/client, a TCP listener and .
     #[inline(never)]
-    pub fn new(output_folder: PathBuf) -> BoxFuture<'static, anyhow::Result<Arc<Self>>> {
-        Self::new_with_opts(output_folder, SessionOptions::default())
+    pub fn new(default_output_folder: PathBuf) -> BoxFuture<'static, anyhow::Result<Arc<Self>>> {
+        Self::new_with_opts(default_output_folder, SessionOptions::default())
     }
 
     pub fn default_persistence_filename() -> anyhow::Result<PathBuf> {
@@ -451,7 +477,7 @@ impl Session {
     /// Create a new session with options.
     #[inline(never)]
     pub fn new_with_opts(
-        output_folder: PathBuf,
+        default_output_folder: PathBuf,
         mut opts: SessionOptions,
     ) -> BoxFuture<'static, anyhow::Result<Arc<Self>>> {
         async move {
@@ -490,9 +516,20 @@ impl Session {
             let peer_opts = opts.peer_opts.unwrap_or_default();
             let persistence_filename = match opts.persistence_filename {
                 Some(filename) => filename,
+                None if !opts.persistence => PathBuf::new(),
                 None => Self::default_persistence_filename()?,
             };
             let spawner = BlockingSpawner::default();
+
+            let (disk_write_tx, disk_write_rx) = opts
+                .defer_writes_up_to
+                .map(|mb| {
+                    const DISK_WRITE_APPROX_WORK_ITEM_SIZE: usize = CHUNK_SIZE as usize + 300;
+                    let count = mb * 1024 * 1024 / DISK_WRITE_APPROX_WORK_ITEM_SIZE;
+                    let (tx, rx) = tokio::sync::mpsc::channel(count);
+                    (Some(tx), Some(rx))
+                })
+                .unwrap_or_default();
 
             let session = Arc::new(Self {
                 persistence_filename,
@@ -500,12 +537,24 @@ impl Session {
                 dht,
                 peer_opts,
                 spawner,
-                output_folder,
+                output_folder: default_output_folder,
                 db: RwLock::new(Default::default()),
                 _cancellation_token_drop_guard: token.clone().drop_guard(),
                 cancellation_token: token,
                 tcp_listen_port,
+                disk_write_tx,
+                default_storage_factory: opts.default_storage_factory,
             });
+
+            if let Some(mut disk_write_rx) = disk_write_rx {
+                session.spawn(error_span!("disk_writer"), async move {
+                    while let Some(work) = disk_write_rx.recv().await {
+                        trace!(disk_write_rx_queue_len = disk_write_rx.len());
+                        spawner.spawn_block_in_place(work);
+                    }
+                    Ok(())
+                });
+            }
 
             if let Some(tcp_listener) = tcp_listener {
                 session.spawn(
@@ -828,7 +877,11 @@ impl Session {
 
                     let peer_rx = self.make_peer_rx(
                         info_hash,
-                        magnet.trackers.clone(),
+                        if opts.disable_trackers {
+                            Default::default()
+                        } else {
+                            magnet.trackers.clone()
+                        },
                         announce_port,
                         opts.force_tracker_interval,
                     )?;
@@ -897,7 +950,11 @@ impl Session {
                     } else {
                         self.make_peer_rx(
                             torrent.info_hash,
-                            trackers.clone(),
+                            if opts.disable_trackers {
+                                Default::default()
+                            } else {
+                                trackers.clone()
+                            },
                             announce_port,
                             opts.force_tracker_interval,
                         )?
@@ -964,7 +1021,7 @@ impl Session {
         trackers: Vec<String>,
         peer_rx: Option<PeerStream>,
         initial_peers: Vec<SocketAddr>,
-        opts: AddTorrentOptions,
+        mut opts: AddTorrentOptions,
     ) -> anyhow::Result<AddTorrentResponse> {
         debug!("Torrent info: {:#?}", &info);
 
@@ -981,9 +1038,17 @@ impl Session {
                     .unwrap_or_default(),
             ),
             (Some(o), None) => PathBuf::from(o),
-            (Some(_), Some(_)) => bail!("you can't provide both output_folder and sub_folder"),
+            (Some(_), Some(_)) => {
+                bail!("you can't provide both output_folder and sub_folder")
+            }
             (None, Some(s)) => self.output_folder.join(s),
         };
+
+        let storage_factory = opts
+            .storage_factory
+            .take()
+            .or_else(|| self.default_storage_factory.as_ref().map(|f| f.clone_box()))
+            .unwrap_or_else(|| FilesystemStorageFactory::default().boxed());
 
         if opts.list_only {
             return Ok(AddTorrentResponse::ListOnly(ListOnlyResponse {
@@ -995,12 +1060,17 @@ impl Session {
             }));
         }
 
-        let mut builder = ManagedTorrentBuilder::new(info, info_hash, output_folder.clone());
+        let mut builder =
+            ManagedTorrentBuilder::new(info, info_hash, output_folder, storage_factory);
         builder
-            .overwrite(opts.overwrite)
+            .allow_overwrite(opts.overwrite)
             .spawner(self.spawner)
             .trackers(trackers)
             .peer_id(self.peer_id);
+
+        if let Some(d) = self.disk_write_tx.clone() {
+            builder.disk_writer(d);
+        }
 
         if let Some(only_files) = only_files {
             builder.only_files(only_files);
@@ -1083,10 +1153,9 @@ impl Session {
                 warn!(error=?e, "error deleting torrent cleanly");
             }
             (Ok(Some(paused)), true) => {
-                for file in paused.files.iter() {
-                    drop(file.take()?);
-                    if let Err(e) = std::fs::remove_file(&file.filename) {
-                        warn!(?file.filename, error=?e, "could not delete file");
+                for (id, fi) in removed.info().file_infos.iter().enumerate() {
+                    if let Err(e) = paused.files.remove_file(id, &fi.relative_filename) {
+                        warn!(?fi.relative_filename, error=?e, "could not delete file");
                     }
                 }
             }
@@ -1170,7 +1239,7 @@ impl tracker_comms::TorrentStatsProvider for PeerRxTorrentInfo {
         let mt = match mt {
             Some(mt) => mt,
             None => {
-                warn!(info_hash=?self.info_hash, "can't find torrent in the session");
+                trace!(info_hash=?self.info_hash, "can't find torrent in the session, using default stats");
                 return Default::default();
             }
         };

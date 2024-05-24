@@ -7,6 +7,10 @@ use librqbit::{
     api::ApiAddTorrentResponse,
     http_api::{HttpApi, HttpApiOptions},
     http_api_client, librqbit_spawn,
+    storage::{
+        filesystem::{FilesystemStorageFactory, MmapFilesystemStorageFactory},
+        StorageFactory, StorageFactoryExt,
+    },
     tracing_subscriber_config_utils::{init_logging, InitLoggingOptions},
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, ListOnlyResponse,
     PeerConnectionOptions, Session, SessionOptions, TorrentStatsState,
@@ -35,7 +39,7 @@ struct Opts {
     log_file: Option<String>,
 
     /// The value for RUST_LOG in the log file
-    #[arg(long = "log-file-rust-log", default_value = "librqbit=trace,info")]
+    #[arg(long = "log-file-rust-log", default_value = "librqbit=debug,info")]
     log_file_rust_log: String,
 
     /// The interval to poll trackers, e.g. 30s.
@@ -93,6 +97,24 @@ struct Opts {
 
     #[command(subcommand)]
     subcommand: SubCommand,
+
+    /// How many maximum blocking tokio threads to spawn to process disk reads/writes.
+    /// This will indicate how many parallel reads/writes can happen at a moment in time.
+    /// The higher the number, the more the memory usage.
+    #[arg(long = "max-blocking-threads", default_value = "8")]
+    max_blocking_threads: u16,
+
+    // If you set this to something, all writes to disk will happen in background and be
+    // buffered in memory up to approximately the given number of megabytes.
+    //
+    // Might be useful for slow disks.
+    #[arg(long = "defer-writes-up-to")]
+    defer_writes_up_to: Option<usize>,
+
+    /// Use mmap (file-backed) for storage. Any advantages are questionable and unproven.
+    /// If you use it, you know what you are doing.
+    #[arg(long)]
+    experimental_mmap_storage: bool,
 }
 
 #[derive(Parser)]
@@ -235,7 +257,7 @@ fn main() -> anyhow::Result<()> {
         // note: we aren't using spawn_blocking() anymore, so this doesn't apply,
         // however I'm still messing around, so in case we do, let's block the number of
         // spawned threads.
-        .max_blocking_threads(8)
+        .max_blocking_threads(opts.max_blocking_threads as usize)
         .build()?;
 
     rt.block_on(async_main(opts))
@@ -278,6 +300,26 @@ async fn async_main(opts: Opts) -> anyhow::Result<()> {
             None
         },
         enable_upnp_port_forwarding: !opts.disable_upnp,
+        defer_writes_up_to: opts.defer_writes_up_to,
+        default_storage_factory: Some({
+            fn wrap<S: StorageFactory + Clone>(s: S) -> impl StorageFactory {
+                #[cfg(feature = "debug_slow_disk")]
+                {
+                    use librqbit::storage::middleware::{
+                        slow::SlowStorageFactory, timing::TimingStorageFactory,
+                    };
+                    TimingStorageFactory::new("hdd".to_owned(), SlowStorageFactory::new(s))
+                }
+                #[cfg(not(feature = "debug_slow_disk"))]
+                s
+            }
+
+            if opts.experimental_mmap_storage {
+                wrap(MmapFilesystemStorageFactory::default()).boxed()
+            } else {
+                wrap(FilesystemStorageFactory::default()).boxed()
+            }
+        }),
     };
 
     let stats_printer = |session: Arc<Session>| async move {
@@ -312,7 +354,7 @@ async fn async_main(opts: Opts) -> anyhow::Result<()> {
                         };
                         let peer_stats = &live_stats.snapshot.peer_stats;
                         info!(
-                            "[{}]: {:.2}% ({:.2} / {:.2}), ↓{:.2} MiB/s, ↑{:.2} MiB/s ({:.2}){}, {{live: {}, queued: {}, dead: {}}}",
+                            "[{}]: {:.2}% ({:.2} / {:.2}), ↓{:.2} MiB/s, ↑{:.2} MiB/s ({:.2}){}, {{live: {}, queued: {}, dead: {}, known: {}}}",
                             idx,
                             downloaded_pct,
                             SF::new(progress),
@@ -321,9 +363,10 @@ async fn async_main(opts: Opts) -> anyhow::Result<()> {
                             up_speed.mbps(),
                             SF::new(live_stats.snapshot.uploaded_bytes),
                             eta,
-                            peer_stats.live + peer_stats.connecting,
-                            peer_stats.queued,
+                            peer_stats.live,
+                            peer_stats.queued + peer_stats.connecting,
                             peer_stats.dead,
+                            peer_stats.seen,
                         );
                     }
                 });
@@ -366,7 +409,8 @@ async fn async_main(opts: Opts) -> anyhow::Result<()> {
             }
             let http_api_url = format!("http://{}", opts.http_api_listen_addr);
             let client = http_api_client::HttpApiClient::new(&http_api_url)?;
-            let torrent_opts = AddTorrentOptions {
+
+            let torrent_opts = || AddTorrentOptions {
                 only_files_regex: download_opts.only_files_matching_regex.clone(),
                 overwrite: download_opts.overwrite,
                 list_only: download_opts.list,
@@ -392,7 +436,7 @@ async fn async_main(opts: Opts) -> anyhow::Result<()> {
                     match client
                         .add_torrent(
                             AddTorrent::from_cli_argument(torrent_url)?,
-                            Some(torrent_opts.clone()),
+                            Some(torrent_opts()),
                         )
                         .await
                     {
@@ -451,19 +495,15 @@ async fn async_main(opts: Opts) -> anyhow::Result<()> {
 
                 for path in &download_opts.torrent_path {
                     let handle = match session
-                        .add_torrent(
-                            AddTorrent::from_cli_argument(path)?,
-                            Some(torrent_opts.clone()),
-                        )
+                        .add_torrent(AddTorrent::from_cli_argument(path)?, Some(torrent_opts()))
                         .await
                     {
                         Ok(v) => match v {
                             AddTorrentResponse::AlreadyManaged(id, handle) => {
                                 info!(
-                                    "torrent {:?} is already managed, id={}, downloaded to {:?}",
+                                    "torrent {:?} is already managed, id={}",
                                     handle.info_hash(),
                                     id,
-                                    handle.info().out_dir
                                 );
                                 continue;
                             }

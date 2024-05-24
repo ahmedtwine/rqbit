@@ -18,7 +18,7 @@ use crate::{
     },
     torrent_state::{
         peer::stats::snapshot::{PeerStatsFilter, PeerStatsSnapshot},
-        ManagedTorrentHandle,
+        FileStream, ManagedTorrentHandle,
     },
     tracing_subscriber_config_utils::LineBroadcast,
 };
@@ -173,10 +173,9 @@ impl Api {
         {
             AddTorrentResponse::AlreadyManaged(id, managed) => {
                 return Err(anyhow::anyhow!(
-                    "{:?} is already managed, id={}, downloaded to {:?}",
+                    "{:?} is already managed, id={}",
                     managed.info_hash(),
                     id,
-                    &managed.info().out_dir
                 ))
                 .with_error_status_code(StatusCode::CONFLICT);
             }
@@ -203,8 +202,13 @@ impl Api {
                 ApiAddTorrentResponse {
                     id: Some(id),
                     details,
-                    output_folder: handle.info().out_dir.to_string_lossy().into_owned(),
                     seen_peers: None,
+                    output_folder: handle
+                        .info()
+                        .options
+                        .output_folder
+                        .to_string_lossy()
+                        .into_owned(),
                 }
             }
         };
@@ -238,6 +242,11 @@ impl Api {
     pub fn api_dump_haves(&self, idx: usize) -> Result<String> {
         let mgr = self.mgr_handle(idx)?;
         Ok(mgr.with_chunk_tracker(|chunks| format!("{:?}", chunks.get_have_pieces()))?)
+    }
+
+    pub fn api_stream(&self, idx: TorrentId, file_id: usize) -> Result<FileStream> {
+        let mgr = self.mgr_handle(idx)?;
+        Ok(mgr.stream(file_id)?)
     }
 }
 

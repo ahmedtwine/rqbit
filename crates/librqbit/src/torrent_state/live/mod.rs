@@ -57,7 +57,6 @@ use anyhow::{bail, Context};
 use backoff::backoff::Backoff;
 use buffers::{ByteBuf, ByteBufOwned};
 use clone_to_owned::CloneToOwned;
-use futures::{stream::FuturesUnordered, StreamExt};
 use librqbit_core::{
     hash_id::Id20,
     lengths::{ChunkInfo, Lengths, ValidPieceIndex},
@@ -87,7 +86,7 @@ use crate::{
     },
     session::CheckedIncomingConnection,
     torrent_state::{peer::Peer, utils::atomic_inc},
-    type_aliases::{OpenedFiles, PeerHandle, BF},
+    type_aliases::{DiskWorkQueueSender, FilePriorities, FileStorage, PeerHandle, BF},
 };
 
 use self::{
@@ -104,10 +103,12 @@ use self::{
 
 use super::{
     paused::TorrentStatePaused,
+    streaming::TorrentStreams,
     utils::{timeit, TimedExistence},
     ManagedTorrentInfo,
 };
 
+#[derive(Debug)]
 struct InflightPiece {
     peer: PeerHandle,
     started: Instant,
@@ -121,6 +122,9 @@ pub(crate) struct TorrentStateLocked {
     // What chunks we have and need.
     // If this is None, the torrent was paused, and this live state is useless, and needs to be dropped.
     pub(crate) chunks: Option<ChunkTracker>,
+
+    // The sorted file list in which order to download them.
+    file_priorities: FilePriorities,
 
     // At a moment in time, we are expecting a piece from only one peer.
     // inflight_pieces stores this information.
@@ -137,7 +141,7 @@ impl TorrentStateLocked {
             .context("chunk tracker empty, torrent was paused")
     }
 
-    fn get_chunks_mut(&mut self) -> anyhow::Result<&mut ChunkTracker> {
+    pub(crate) fn get_chunks_mut(&mut self) -> anyhow::Result<&mut ChunkTracker> {
         self.chunks
             .as_mut()
             .context("chunk tracker empty, torrent was paused")
@@ -155,7 +159,9 @@ pub struct TorrentStateLive {
     meta: Arc<ManagedTorrentInfo>,
     locked: RwLock<TorrentStateLocked>,
 
-    files: OpenedFiles,
+    pub(crate) files: FileStorage,
+
+    per_piece_locks: Vec<RwLock<()>>,
 
     stats: AtomicStats,
     lengths: Lengths,
@@ -171,32 +177,9 @@ pub struct TorrentStateLive {
     down_speed_estimator: SpeedEstimator,
     up_speed_estimator: SpeedEstimator,
     cancellation_token: CancellationToken,
-}
 
-fn reopen_necessary_files_for_write(ct: &ChunkTracker, files: &OpenedFiles) -> anyhow::Result<()> {
-    // Reopen files that we don't have, but have selected in write-only mode.
-    for opened_file in files.iter() {
-        let prange = opened_file.piece_range_usize();
-        if prange.is_empty() {
-            continue;
-        }
-        let selected = ct
-            .get_selected_pieces()
-            .get(prange.clone())
-            .with_context(|| format!("bug: bad range get_selected_pieces(), {prange:?}"))?;
-        let have = ct
-            .get_have_pieces()
-            .get(prange.clone())
-            .with_context(|| format!("bug: bad range get_have_pieces(), {prange:?}"))?;
-        let need_write = selected
-            .iter()
-            .zip(have.iter())
-            .any(|(selected, have)| *selected && !*have);
-        if need_write {
-            opened_file.reopen(false)?;
-        }
-    }
-    Ok(())
+    pub(crate) streams: Arc<TorrentStreams>,
+    have_broadcast_tx: tokio::sync::broadcast::Sender<ValidPieceIndex>,
 }
 
 impl TorrentStateLive {
@@ -213,14 +196,30 @@ impl TorrentStateLive {
         let have_bytes = paused.chunk_tracker.get_hns().have_bytes;
         let lengths = *paused.chunk_tracker.get_lengths();
 
-        reopen_necessary_files_for_write(&paused.chunk_tracker, &paused.files)?;
+        // TODO: make it configurable
+        let file_priorities = {
+            let mut pri = (0..paused.info.file_infos.len()).collect::<Vec<usize>>();
+            // sort by filename, cause many torrents have random sort order.
+            pri.sort_unstable_by_key(|id| {
+                paused
+                    .info
+                    .file_infos
+                    .get(*id)
+                    .map(|fi| fi.relative_filename.as_path())
+            });
+            pri
+        };
+
+        let (have_broadcast_tx, _) = tokio::sync::broadcast::channel(128);
 
         let state = Arc::new(TorrentStateLive {
             meta: paused.info.clone(),
             peers: Default::default(),
             locked: RwLock::new(TorrentStateLocked {
                 chunks: Some(paused.chunk_tracker),
+                // TODO: move under per_piece_locks?
                 inflight_pieces: Default::default(),
+                file_priorities,
                 fatal_errors_tx: Some(fatal_errors_tx),
             }),
             files: paused.files,
@@ -235,6 +234,11 @@ impl TorrentStateLive {
             down_speed_estimator,
             up_speed_estimator,
             cancellation_token,
+            have_broadcast_tx,
+            streams: paused.streams,
+            per_piece_locks: (0..lengths.total_pieces())
+                .map(|_| RwLock::new(()))
+                .collect(),
         });
 
         state.spawn(
@@ -286,6 +290,10 @@ impl TorrentStateLive {
         &self.up_speed_estimator
     }
 
+    fn disk_work_tx(&self) -> Option<&DiskWorkQueueSender> {
+        self.meta.options.disk_write_queue.as_ref()
+    }
+
     pub(crate) fn add_incoming_peer(
         self: &Arc<Self>,
         checked_peer: CheckedIncomingConnection,
@@ -295,7 +303,7 @@ impl TorrentStateLive {
         let permit = match self.peer_semaphore.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                warn!("limit of live peers reached, dropping incoming peer");
+                debug!("limit of live peers reached, dropping incoming peer");
                 self.peers.with_peer(checked_peer.addr, |p| {
                     atomic_inc(&p.stats.counters.incoming_connections);
                 });
@@ -381,7 +389,8 @@ impl TorrentStateLive {
                 rx,
                 checked_peer.read_buf,
                 checked_peer.handshake,
-                checked_peer.stream
+                checked_peer.stream,
+                self.have_broadcast_tx.subscribe()
             ) => {r}
         };
 
@@ -442,7 +451,7 @@ impl TorrentStateLive {
             .fetch_add(1, Ordering::Relaxed);
         let res = tokio::select! {
             r = requester => {r}
-            r = peer_connection.manage_peer_outgoing(rx) => {r}
+            r = peer_connection.manage_peer_outgoing(rx, state.have_broadcast_tx.subscribe()) => {r}
         };
 
         match res {
@@ -466,7 +475,7 @@ impl TorrentStateLive {
         let state = self;
         loop {
             let addr = peer_queue_rx.recv().await.context("torrent closed")?;
-            if state.is_finished() {
+            if state.is_finished_and_dont_need_peers() {
                 debug!("ignoring peer {} as we are finished", addr);
                 state.peers.mark_peer_not_needed(addr);
                 continue;
@@ -494,7 +503,12 @@ impl TorrentStateLive {
         self.meta.peer_id
     }
     pub(crate) fn file_ops(&self) -> FileOps<'_> {
-        FileOps::new(&self.meta.info, &self.files, &self.lengths)
+        FileOps::new(
+            &self.meta.info,
+            &*self.files,
+            &self.meta().file_infos,
+            &self.lengths,
+        )
     }
 
     pub(crate) fn lock_read(
@@ -537,61 +551,8 @@ impl TorrentStateLive {
             .map(|c| *c.get_hns())
     }
 
-    fn maybe_transmit_haves(&self, index: ValidPieceIndex) {
-        let mut futures = Vec::new();
-
-        for pe in self.peers.states.iter() {
-            match &pe.value().state.get() {
-                PeerState::Live(live) => {
-                    if !live.peer_interested {
-                        continue;
-                    }
-
-                    if live
-                        .bitfield
-                        .get(index.get() as usize)
-                        .map(|v| *v)
-                        .unwrap_or(false)
-                    {
-                        continue;
-                    }
-
-                    let tx = live.tx.downgrade();
-                    futures.push(async move {
-                        if let Some(tx) = tx.upgrade() {
-                            if tx
-                                .send(WriterRequest::Message(Message::Have(index.get())))
-                                .is_err()
-                            {
-                                // whatever
-                            }
-                        }
-                    });
-                }
-                _ => continue,
-            }
-        }
-
-        if futures.is_empty() {
-            trace!("no peers to transmit Have={} to, saving some work", index);
-            return;
-        }
-
-        let mut unordered: FuturesUnordered<_> = futures.into_iter().collect();
-
-        // We don't want to remember this task as there may be too many.
-        self.spawn(
-            error_span!(
-                parent: self.meta.span.clone(),
-                "transmit_haves",
-                piece = index.get(),
-                count = unordered.len()
-            ),
-            async move {
-                while unordered.next().await.is_some() {}
-                Ok(())
-            },
-        );
+    fn transmit_haves(&self, index: ValidPieceIndex) {
+        let _ = self.have_broadcast_tx.send(index);
     }
 
     pub(crate) fn add_peer_if_not_seen(&self, addr: SocketAddr) -> anyhow::Result<bool> {
@@ -644,14 +605,6 @@ impl TorrentStateLive {
         // It should be impossible to make a fatal error after pausing.
         g.fatal_errors_tx.take();
 
-        let files = self
-            .files
-            .iter()
-            .map(|f| f.take_clone())
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        for file in files.iter() {
-            file.reopen(true)?;
-        }
         let mut chunk_tracker = g
             .chunks
             .take()
@@ -663,8 +616,9 @@ impl TorrentStateLive {
         // g.chunks;
         Ok(TorrentStatePaused {
             info: self.meta.clone(),
-            files,
+            files: self.files.take()?,
             chunk_tracker,
+            streams: self.streams.clone(),
         })
     }
 
@@ -684,8 +638,7 @@ impl TorrentStateLive {
     pub(crate) fn update_only_files(&self, only_files: &HashSet<usize>) -> anyhow::Result<()> {
         let mut g = self.lock_write("update_only_files");
         let ct = g.get_chunks_mut()?;
-        let hns = ct.update_only_files(self.files.iter().map(|f| f.len), only_files)?;
-        reopen_necessary_files_for_write(ct, &self.files)?;
+        let hns = ct.update_only_files(self.meta().file_infos.iter().map(|f| f.len), only_files)?;
         if !hns.finished() {
             self.reconnect_all_not_needed_peers();
         }
@@ -696,41 +649,53 @@ impl TorrentStateLive {
         self.get_hns().map(|h| h.finished()).unwrap_or_default()
     }
 
+    fn has_active_streams_unfinished_files(&self, state: &TorrentStateLocked) -> bool {
+        let chunks = match state.get_chunks() {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        self.streams
+            .streamed_file_ids()
+            .any(|file_id| !chunks.is_file_finished(&self.meta.file_infos[file_id]))
+    }
+
+    fn is_finished_and_dont_need_peers(&self) -> bool {
+        self.is_finished()
+            && !self.has_active_streams_unfinished_files(
+                &self.lock_read("is_finished_and_dont_need_peers"),
+            )
+    }
+
     fn on_piece_completed(&self, id: ValidPieceIndex) -> anyhow::Result<()> {
+        let mut g = self.lock_write("on_piece_completed");
+        let chunks = g.get_chunks_mut()?;
+
         // if we have all the pieces of the file, reopen it read only
-        for (idx, opened_file) in self
-            .files
+        for (idx, file_info) in self
+            .meta()
+            .file_infos
             .iter()
             .enumerate()
-            .skip_while(|fd| !fd.1.piece_range.contains(&id.get()))
-            .take_while(|fd| fd.1.piece_range.contains(&id.get()))
+            .skip_while(|(_, fi)| !fi.piece_range.contains(&id.get()))
+            .take_while(|(_, fi)| fi.piece_range.contains(&id.get()))
         {
-            let bytes = opened_file.update_have_on_piece_completed(id.get(), &self.lengths);
-            if bytes == 0 {
-                warn!(file_id=idx, piece_id=id.get(), "bug: update_have_on_piece_completed() returned 0, although this piece is present in the file");
-            }
-
-            let have_all = self
-                .lock_read("on_piece_completed_reopen")
-                .get_chunks()?
-                .get_have_pieces()
-                .get(opened_file.piece_range_usize())
-                .with_context(|| {
-                    format!("bug: invalid range {:?}", opened_file.piece_range_usize())
-                })?
-                .all();
-            if have_all {
-                opened_file.reopen(true)?;
-            }
+            let _remaining = chunks.update_file_have_on_piece_completed(id, idx, file_info);
         }
 
-        if self.is_finished() {
-            info!("torrent finished downloading");
+        self.streams
+            .wake_streams_on_piece_completed(id, &self.meta.lengths);
+
+        if chunks.is_finished() {
+            if chunks.get_selected_pieces()[id.get_usize()] {
+                info!("torrent finished downloading");
+            }
             self.finished_notify.notify_waiters();
 
-            // There is not poing being connected to peers that have all the torrent, when
-            // we don't need anything from them, and they don't need anything from us.
-            self.disconnect_all_peers_that_have_full_torrent();
+            if !self.has_active_streams_unfinished_files(&g) {
+                // There is not poing being connected to peers that have all the torrent, when
+                // we don't need anything from them, and they don't need anything from us.
+                self.disconnect_all_peers_that_have_full_torrent();
+            }
         }
         Ok(())
     }
@@ -744,27 +709,20 @@ impl TorrentStateLive {
                         .take_live_no_counters()
                         .unwrap()
                         .tx
-                        .send(WriterRequest::Disconnect);
+                        .send(WriterRequest::Disconnect(Ok(())));
                 }
             }
         }
     }
 
-    fn reconnect_all_not_needed_peers(&self) {
-        for pe in self.peers.states.iter() {
-            if let PeerState::NotNeeded = pe.value().state.get() {
-                if self.peer_queue_tx.send(*pe.key()).is_err() {
-                    return;
-                }
+    pub(crate) fn reconnect_all_not_needed_peers(&self) {
+        for mut pe in self.peers.states.iter_mut() {
+            if pe.state.not_needed_to_queued(&self.peers.stats)
+                && self.peer_queue_tx.send(*pe.key()).is_err()
+            {
+                return;
             }
         }
-    }
-
-    pub(crate) fn get_file_progress(&self) -> Vec<u64> {
-        self.files
-            .iter()
-            .map(|fd| fd.have.load(Ordering::Relaxed))
-            .collect()
     }
 }
 
@@ -804,11 +762,13 @@ impl<'a> PeerConnectionHandler for &'a PeerHandler {
         self.counters
             .outgoing_connections
             .fetch_add(1, Ordering::Relaxed);
+        #[allow(clippy::cast_possible_truncation)]
         self.counters
             .total_time_connecting_ms
             .fetch_add(connection_time.as_millis() as u64, Ordering::Relaxed);
     }
-    fn on_received_message(&self, message: Message<ByteBuf<'_>>) -> anyhow::Result<()> {
+
+    async fn on_received_message(&self, message: Message<ByteBuf<'_>>) -> anyhow::Result<()> {
         match message {
             Message::Request(request) => {
                 self.on_download_request(request)
@@ -820,7 +780,10 @@ impl<'a> PeerConnectionHandler for &'a PeerHandler {
             Message::Choke => self.on_i_am_choked(),
             Message::Unchoke => self.on_i_am_unchoked(),
             Message::Interested => self.on_peer_interested(),
-            Message::Piece(piece) => self.on_received_piece(piece).context("on_received_piece")?,
+            Message::Piece(piece) => self
+                .on_received_piece(piece)
+                .await
+                .context("on_received_piece")?,
             Message::KeepAlive => {
                 trace!("keepalive received");
             }
@@ -870,6 +833,17 @@ impl<'a> PeerConnectionHandler for &'a PeerHandler {
 
     fn get_have_bytes(&self) -> u64 {
         self.state.get_approx_have_bytes()
+    }
+
+    fn should_transmit_have(&self, id: ValidPieceIndex) -> bool {
+        let have = self
+            .state
+            .peers
+            .with_live(self.addr, |l| {
+                l.bitfield.get(id.get_usize()).map(|p| *p).unwrap_or(true)
+            })
+            .unwrap_or(true);
+        !have
     }
 }
 
@@ -926,7 +900,7 @@ impl PeerHandler {
 
         self.counters.errors.fetch_add(1, Ordering::Relaxed);
 
-        if self.state.is_finished() {
+        if self.state.is_finished_and_dont_need_peers() {
             trace!("torrent finished, not re-queueing");
             pe.value_mut().state.set(PeerState::NotNeeded, pstats);
             return Ok(());
@@ -989,22 +963,28 @@ impl PeerHandler {
                 let n = {
                     let mut n_opt = None;
                     let bf = &live.bitfield;
-                    for n in g.get_chunks()?.iter_queued_pieces() {
-                        if bf.get(n).map(|v| *v) == Some(true) {
+                    let chunk_tracker = g.get_chunks()?;
+                    let priority_streamed_pieces = self
+                        .state
+                        .streams
+                        .iter_next_pieces(&self.state.lengths)
+                        .filter(|pid| {
+                            !chunk_tracker.is_piece_have(*pid)
+                                && !g.inflight_pieces.contains_key(pid)
+                        });
+                    let natural_order_pieces = chunk_tracker
+                        .iter_queued_pieces(&g.file_priorities, &self.state.meta().file_infos);
+                    for n in priority_streamed_pieces.chain(natural_order_pieces) {
+                        if bf.get(n.get() as usize).map(|v| *v) == Some(true) {
                             n_opt = Some(n);
                             break;
                         }
                     }
 
-                    let n_opt = match n_opt {
+                    match n_opt {
                         Some(n_opt) => n_opt,
                         None => return Ok(None),
-                    };
-
-                    self.state
-                        .lengths
-                        .validate_piece_index(n_opt as u32)
-                        .context("bug: invalid piece")?
+                    }
                 };
                 g.inflight_pieces.insert(
                     n,
@@ -1042,14 +1022,20 @@ impl PeerHandler {
 
             // heuristic for "too slow peer"
             if elapsed.as_secs_f64() > my_avg_time.as_secs_f64() * threshold {
-                debug!(
-                    "will steal piece {} from {}: elapsed time {:?}, my avg piece time: {:?}",
-                    idx, piece_req.peer, elapsed, my_avg_time
-                );
-                let old = piece_req.peer;
-                piece_req.peer = self.addr;
-                piece_req.started = Instant::now();
-                (*idx, old)
+                // If the piece is locked and someone is actively writing to disk, don't steal it.
+                if let Some(_g) = self.state.per_piece_locks[idx.get_usize()].try_write() {
+                    debug!(
+                        "will steal piece {} from {}: elapsed time {:?}, my avg piece time: {:?}",
+                        idx, piece_req.peer, elapsed, my_avg_time
+                    );
+                    let old = piece_req.peer;
+                    piece_req.peer = self.addr;
+                    piece_req.started = Instant::now();
+                    (*idx, old)
+                } else {
+                    debug!(?idx, ?piece_req, "attempted to steal but peer was writing");
+                    return None;
+                }
             } else {
                 return None;
             }
@@ -1173,7 +1159,7 @@ impl PeerHandler {
 
         // TODO: this check needs to happen more often, we need to update our
         // interested state with the other side, for now we send it only once.
-        if self.state.is_finished() {
+        if self.state.is_finished_and_dont_need_peers() {
             self.tx
                 .send(WriterRequest::Message(MessageOwned::NotInterested))?;
 
@@ -1186,7 +1172,7 @@ impl PeerHandler {
                 .unwrap_or_default()
             {
                 debug!("both peer and us have full torrent, disconnecting");
-                self.tx.send(WriterRequest::Disconnect)?;
+                self.tx.send(WriterRequest::Disconnect(Ok(())))?;
                 // Sleep a bit to ensure this gets written to the network by manage_peer
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 return Ok(());
@@ -1199,11 +1185,9 @@ impl PeerHandler {
         loop {
             self.wait_for_unchoke().await;
 
-            if self.state.is_finished() {
-                debug!("nothing left to download, looping forever until manage_peer quits");
-                loop {
-                    tokio::time::sleep(Duration::from_secs(86400)).await;
-                }
+            if self.state.is_finished_and_dont_need_peers() {
+                debug!("nothing left to do, disconnecting peer");
+                return Ok(());
             }
 
             // Try steal a pice from a very slow peer first. Otherwise we might wait too long
@@ -1282,10 +1266,13 @@ impl PeerHandler {
         trace!("we are unchoked");
         self.locked.write().i_am_choked = false;
         self.unchoke_notify.notify_waiters();
-        self.requests_sem.add_permits(16);
+        // 128 should be more than enough to maintain 100mbps
+        // for a single peer that has 100ms ping
+        // https://www.desmos.com/calculator/x3szur87ps
+        self.requests_sem.add_permits(128);
     }
 
-    fn on_received_piece(&self, piece: Piece<ByteBuf>) -> anyhow::Result<()> {
+    async fn on_received_piece(&self, piece: Piece<ByteBuf<'_>>) -> anyhow::Result<()> {
         let piece_index = self
             .state
             .lengths
@@ -1294,7 +1281,7 @@ impl PeerHandler {
         let chunk_info = match self.state.lengths.chunk_info_from_received_data(
             piece_index,
             piece.begin,
-            piece.block.len() as u32,
+            piece.block.len().try_into().context("bug")?,
         ) {
             Some(i) => i,
             None => {
@@ -1324,151 +1311,193 @@ impl PeerHandler {
             })
             .context("peer not found")??;
 
-        let full_piece_download_time = {
-            let mut g = self.state.lock_write("mark_chunk_downloaded");
+        // This one is used to calculate download speed.
+        self.state
+            .stats
+            .fetched_bytes
+            .fetch_add(piece.block.as_ref().len() as u64, Ordering::Relaxed);
 
-            match g.inflight_pieces.get(&chunk_info.piece_index) {
-                Some(InflightPiece { peer, .. }) if *peer == self.addr => {}
-                Some(InflightPiece { peer, .. }) => {
-                    debug!(
-                        "in-flight piece {} was stolen by {}, ignoring",
-                        chunk_info.piece_index, peer
-                    );
-                    return Ok(());
-                }
-                None => {
-                    debug!(
-                        "in-flight piece {} not found. it was probably completed by someone else",
-                        chunk_info.piece_index
-                    );
-                    return Ok(());
+        fn write_to_disk(
+            state: &TorrentStateLive,
+            addr: PeerHandle,
+            counters: &AtomicPeerCounters,
+            piece: &Piece<impl AsRef<[u8]> + std::fmt::Debug>,
+            chunk_info: &ChunkInfo,
+        ) -> anyhow::Result<()> {
+            let index = piece.index;
+
+            // If someone stole the piece by now, ignore it.
+            // However if they didn't, don't let them steal it while we are writing.
+            // So that by the time we are done writing AND if it was the last piece,
+            // we can actually checksum etc.
+            // Otherwise it might get into some weird state.
+            let ppl_guard = {
+                let g = state.lock_read("check_steal");
+
+                let ppl = state
+                    .per_piece_locks
+                    .get(piece.index as usize)
+                    .map(|l| l.read());
+
+                match g.inflight_pieces.get(&chunk_info.piece_index) {
+                    Some(InflightPiece { peer, .. }) if *peer == addr => {}
+                    Some(InflightPiece { peer, .. }) => {
+                        debug!(
+                            "in-flight piece {} was stolen by {}, ignoring",
+                            chunk_info.piece_index, peer
+                        );
+                        return Ok(());
+                    }
+                    None => {
+                        debug!(
+                            "in-flight piece {} not found. it was probably completed by someone else",
+                            chunk_info.piece_index
+                        );
+                        return Ok(());
+                    }
+                };
+
+                ppl
+            };
+
+            // While we hold per piece lock, noone can steal it.
+            // So we can proceed writing knowing that the piece is ours now and will still be by the time
+            // the write is finished.
+            match state.file_ops().write_chunk(addr, piece, chunk_info) {
+                Ok(()) => {}
+                Err(e) => {
+                    error!("FATAL: error writing chunk to disk: {:?}", e);
+                    return state.on_fatal_error(e);
                 }
             };
 
-            match g.get_chunks_mut()?.mark_chunk_downloaded(&piece) {
-                Some(ChunkMarkingResult::Completed) => {
-                    trace!("piece={} done, will write and checksum", piece.index,);
-                    // This will prevent others from stealing it.
-                    {
-                        let piece = chunk_info.piece_index;
-                        g.inflight_pieces.remove(&piece)
-                    }
-                    .map(|t| t.started.elapsed())
-                }
-                Some(ChunkMarkingResult::PreviouslyCompleted) => {
-                    // TODO: we might need to send cancellations here.
-                    debug!("piece={} was done by someone else, ignoring", piece.index,);
-                    return Ok(());
-                }
-                Some(ChunkMarkingResult::NotCompleted) => None,
-                None => {
-                    anyhow::bail!(
-                        "bogus data received: {:?}, cannot map this to a chunk, dropping peer",
-                        piece
-                    );
-                }
-            }
-        };
+            let full_piece_download_time = {
+                let mut g = state.lock_write("mark_chunk_downloaded");
+                let chunk_marking_result = g.get_chunks_mut()?.mark_chunk_downloaded(piece);
+                trace!(?piece, chunk_marking_result=?chunk_marking_result);
 
-        // By this time we reach here, no other peer can for this piece. All others, even if they steal pieces would
-        // have fallen off above in one of the defensive checks.
-
-        self.state
-            .meta
-            .spawner
-            .spawn_block_in_place(move || {
-                let index = piece.index;
-
-                // TODO: in theory we should unmark the piece as downloaded here. But if there was a disk error, what
-                // should we really do? If we unmark it, it will get requested forever...
-                //
-                // So let's just unwrap and abort.
-                match self
-                    .state
-                    .file_ops()
-                    .write_chunk(self.addr, &piece, &chunk_info)
-                {
-                    Ok(()) => {}
-                    Err(e) => {
-                        error!("FATAL: error writing chunk to disk: {:?}", e);
-                        return self.state.on_fatal_error(e);
-                    }
-                }
-
-                // Global chunk/byte counters.
-                self.state
-                    .stats
-                    .fetched_bytes
-                    .fetch_add(piece.block.len() as u64, Ordering::Relaxed);
-
-                let full_piece_download_time = match full_piece_download_time {
-                    Some(t) => t,
-                    None => return Ok(()),
-                };
-
-                match self
-                    .state
-                    .file_ops()
-                    .check_piece(self.addr, chunk_info.piece_index, &chunk_info)
-                    .with_context(|| format!("error checking piece={index}"))?
-                {
-                    true => {
+                match chunk_marking_result {
+                    Some(ChunkMarkingResult::Completed) => {
+                        trace!("piece={} done, will write and checksum", piece.index);
+                        // This will prevent others from stealing it.
                         {
-                            let mut g = self.state.lock_write("mark_piece_downloaded");
-                            g.get_chunks_mut()?
-                                .mark_piece_downloaded(chunk_info.piece_index);
+                            let piece = chunk_info.piece_index;
+                            g.inflight_pieces.remove(&piece)
                         }
-
-                        // Global piece counters.
-                        let piece_len =
-                            self.state.lengths.piece_length(chunk_info.piece_index) as u64;
-                        self.state
-                            .stats
-                            .downloaded_and_checked_bytes
-                            // This counter is used to compute "is_finished", so using
-                            // stronger ordering.
-                            .fetch_add(piece_len, Ordering::Release);
-                        self.state
-                            .stats
-                            .downloaded_and_checked_pieces
-                            // This counter is used to compute "is_finished", so using
-                            // stronger ordering.
-                            .fetch_add(1, Ordering::Release);
-                        self.state
-                            .stats
-                            .have_bytes
-                            .fetch_add(piece_len, Ordering::Relaxed);
-                        self.state.stats.total_piece_download_ms.fetch_add(
-                            full_piece_download_time.as_millis() as u64,
-                            Ordering::Relaxed,
-                        );
-
-                        // Per-peer piece counters.
-                        self.counters
-                            .on_piece_downloaded(piece_len, full_piece_download_time);
-                        self.state.peers.reset_peer_backoff(self.addr);
-
-                        debug!("piece={} successfully downloaded and verified", index);
-
-                        self.state.on_piece_completed(chunk_info.piece_index)?;
-
-                        self.state.maybe_transmit_haves(chunk_info.piece_index);
+                        .map(|t| t.started.elapsed())
                     }
-                    false => {
-                        warn!(
-                            "checksum for piece={} did not validate. disconecting peer.",
-                            index
-                        );
-                        self.state
-                            .lock_write("mark_piece_broken")
-                            .get_chunks_mut()?
-                            .mark_piece_broken_if_not_have(chunk_info.piece_index);
-                        anyhow::bail!("i am probably a bogus peer. dying.")
+                    Some(ChunkMarkingResult::PreviouslyCompleted) => {
+                        // TODO: we might need to send cancellations here.
+                        debug!("piece={} was done by someone else, ignoring", piece.index);
+                        return Ok(());
                     }
-                };
-                Ok::<_, anyhow::Error>(())
-            })
-            .with_context(|| format!("error processing received chunk {chunk_info:?}"))?;
+                    Some(ChunkMarkingResult::NotCompleted) => None,
+                    None => {
+                        anyhow::bail!(
+                            "bogus data received: {:?}, cannot map this to a chunk, dropping peer",
+                            piece
+                        );
+                    }
+                }
+            };
+
+            // We don't care about per piece lock anymore, as it's removed from inflight pieces.
+            // It shouldn't impact perf anyway, but dropping just in case.
+            drop(ppl_guard);
+
+            let full_piece_download_time = match full_piece_download_time {
+                Some(t) => t,
+                None => return Ok(()),
+            };
+
+            match state
+                .file_ops()
+                .check_piece(addr, chunk_info.piece_index, chunk_info)
+                .with_context(|| format!("error checking piece={index}"))?
+            {
+                true => {
+                    {
+                        let mut g = state.lock_write("mark_piece_downloaded");
+                        g.get_chunks_mut()?
+                            .mark_piece_downloaded(chunk_info.piece_index);
+                    }
+
+                    // Global piece counters.
+                    let piece_len = state.lengths.piece_length(chunk_info.piece_index) as u64;
+                    state
+                        .stats
+                        .downloaded_and_checked_bytes
+                        // This counter is used to compute "is_finished", so using
+                        // stronger ordering.
+                        .fetch_add(piece_len, Ordering::Release);
+                    state
+                        .stats
+                        .downloaded_and_checked_pieces
+                        // This counter is used to compute "is_finished", so using
+                        // stronger ordering.
+                        .fetch_add(1, Ordering::Release);
+                    state
+                        .stats
+                        .have_bytes
+                        .fetch_add(piece_len, Ordering::Relaxed);
+                    #[allow(clippy::cast_possible_truncation)]
+                    state.stats.total_piece_download_ms.fetch_add(
+                        full_piece_download_time.as_millis() as u64,
+                        Ordering::Relaxed,
+                    );
+
+                    // Per-peer piece counters.
+                    counters.on_piece_completed(piece_len, full_piece_download_time);
+                    state.peers.reset_peer_backoff(addr);
+
+                    debug!("piece={} successfully downloaded and verified", index);
+
+                    state.on_piece_completed(chunk_info.piece_index)?;
+
+                    state.transmit_haves(chunk_info.piece_index);
+                }
+                false => {
+                    warn!(
+                        "checksum for piece={} did not validate. disconecting peer.",
+                        index
+                    );
+                    state
+                        .lock_write("mark_piece_broken")
+                        .get_chunks_mut()?
+                        .mark_piece_broken_if_not_have(chunk_info.piece_index);
+                    anyhow::bail!("i am probably a bogus peer. dying.")
+                }
+            };
+            Ok(())
+        }
+
+        if let Some(dtx) = self.state.disk_work_tx() {
+            // TODO: shove all this into one thing to .clone() once rather than 5 times.
+            let state = self.state.clone();
+            let addr = self.addr;
+            let counters = self.counters.clone();
+            let piece = piece.clone_to_owned();
+            let tx = self.tx.clone();
+
+            let span = tracing::error_span!("deferred_write");
+            let work = move || {
+                span.in_scope(|| {
+                    if let Err(e) = write_to_disk(&state, addr, &counters, &piece, &chunk_info) {
+                        let _ = tx.send(WriterRequest::Disconnect(Err(e)));
+                    }
+                })
+            };
+            dtx.send(Box::new(work)).await?;
+        } else {
+            self.state
+                .meta
+                .spawner
+                .spawn_block_in_place(|| {
+                    write_to_disk(&self.state, self.addr, &self.counters, &piece, &chunk_info)
+                })
+                .with_context(|| format!("error processing received chunk {chunk_info:?}"))?;
+        }
+
         Ok(())
     }
 }

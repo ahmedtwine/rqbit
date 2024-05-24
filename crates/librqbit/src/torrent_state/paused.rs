@@ -2,15 +2,16 @@ use std::{collections::HashSet, sync::Arc};
 
 use crate::{
     chunk_tracker::{ChunkTracker, HaveNeededSelected},
-    type_aliases::OpenedFiles,
+    type_aliases::FileStorage,
 };
 
-use super::ManagedTorrentInfo;
+use super::{streaming::TorrentStreams, ManagedTorrentInfo};
 
 pub struct TorrentStatePaused {
     pub(crate) info: Arc<ManagedTorrentInfo>,
-    pub(crate) files: OpenedFiles,
+    pub(crate) files: FileStorage,
     pub(crate) chunk_tracker: ChunkTracker,
+    pub(crate) streams: Arc<TorrentStreams>,
 }
 
 impl TorrentStatePaused {

@@ -23,20 +23,24 @@
 //! a facade that works with simple serializable types.
 //!
 
+#![warn(clippy::cast_possible_truncation)]
+
 pub mod api;
 mod api_error;
 mod chunk_tracker;
 mod create_torrent_file;
 mod dht_utils;
+pub mod file_info;
 mod file_ops;
 pub mod http_api;
 pub mod http_api_client;
-mod opened_file;
+mod merge_streams;
 mod peer_connection;
 mod peer_info_reader;
 mod read_buf;
 mod session;
 mod spawn_utils;
+pub mod storage;
 pub mod torrent_state;
 pub mod tracing_subscriber_config_utils;
 mod type_aliases;
@@ -51,7 +55,10 @@ pub use session::{
     SUPPORTED_SCHEMES,
 };
 pub use spawn_utils::spawn as librqbit_spawn;
-pub use torrent_state::{ManagedTorrent, ManagedTorrentState, TorrentStats, TorrentStatsState};
+pub use torrent_state::{
+    ManagedTorrent, ManagedTorrentInfo, ManagedTorrentState, TorrentStats, TorrentStatsState,
+};
+pub use type_aliases::FileInfos;
 
 pub use buffers::*;
 pub use clone_to_owned::CloneToOwned;

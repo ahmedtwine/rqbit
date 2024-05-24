@@ -5,7 +5,10 @@ use librqbit_core::lengths::{ChunkInfo, Lengths, ValidPieceIndex};
 use peer_binary_protocol::Piece;
 use tracing::{debug, trace};
 
-use crate::type_aliases::BF;
+use crate::{
+    file_info::FileInfo,
+    type_aliases::{FileInfos, FilePriorities, BF},
+};
 
 pub struct ChunkTracker {
     // This forms the basis of a "queue" to pull from.
@@ -29,10 +32,10 @@ pub struct ChunkTracker {
     // was called.
     selected: BF,
 
-    lengths: Lengths,
+    // How many bytes do we have per each file.
+    per_file_bytes: Vec<u64>,
 
-    // What pieces to download first.
-    priority_piece_ids: Vec<usize>,
+    lengths: Lengths,
 
     // Quick to retrieve stats, that MUST be in sync with the BFs
     // above (have/selected).
@@ -118,6 +121,7 @@ fn compute_queued_pieces(have_pieces: &BF, selected_pieces: &BF) -> anyhow::Resu
     ))
 }
 
+#[derive(Debug)]
 pub enum ChunkMarkingResult {
     PreviouslyCompleted,
     NotCompleted,
@@ -131,6 +135,7 @@ impl ChunkTracker {
         // Selected pieces are the ones the user has selected
         selected_pieces: BF,
         lengths: Lengths,
+        file_infos: &FileInfos,
     ) -> anyhow::Result<Self> {
         let needed_pieces = compute_queued_pieces(&have_pieces, &selected_pieces)
             .context("error computing needed pieces")?;
@@ -138,18 +143,6 @@ impl ChunkTracker {
         // TODO: ideally this needs to be a list based on needed files, e.g.
         // last needed piece for each file. But let's keep simple for now.
 
-        // TODO: bitvec is bugged, the short version panics.
-        // let last_needed_piece_id = needed_pieces.iter_ones().next_back();
-        let last_needed_piece_id = needed_pieces
-            .iter()
-            .enumerate()
-            .filter_map(|(id, b)| if *b { Some(id) } else { None })
-            .last();
-
-        // The last pieces first. Often important information is stored in the last piece.
-        // E.g. if it's a video file, than the last piece often contains some index, or just
-        // players look into it, and it's better be there.
-        let priority_piece_ids = last_needed_piece_id.into_iter().collect();
         let mut ct = Self {
             chunk_status: compute_chunk_have_status(&lengths, &have_pieces)
                 .context("error computing chunk status")?,
@@ -157,11 +150,26 @@ impl ChunkTracker {
             selected: selected_pieces,
             lengths,
             have: have_pieces,
-            priority_piece_ids,
             hns: HaveNeededSelected::default(),
+            per_file_bytes: vec![0; file_infos.len()],
         };
+        ct.recalculate_per_file_bytes(file_infos);
         ct.hns = ct.calc_hns();
         Ok(ct)
+    }
+
+    fn recalculate_per_file_bytes(&mut self, file_infos: &FileInfos) {
+        for (slot, fi) in self.per_file_bytes.iter_mut().zip(file_infos.iter()) {
+            *slot = fi
+                .piece_range
+                .clone()
+                .filter(|p| self.have[*p as usize])
+                .map(|id| {
+                    self.lengths
+                        .size_of_piece_in_file(id, fi.offset_in_torrent, fi.len)
+                })
+                .sum();
+        }
     }
 
     pub fn get_lengths(&self) -> &Lengths {
@@ -172,9 +180,6 @@ impl ChunkTracker {
         &self.have
     }
 
-    pub fn get_selected_pieces(&self) -> &BF {
-        &self.selected
-    }
     pub fn reserve_needed_piece(&mut self, index: ValidPieceIndex) {
         self.queue_pieces.set(index.get() as usize, false)
     }
@@ -198,16 +203,23 @@ impl ChunkTracker {
         hns
     }
 
-    pub fn iter_queued_pieces(&self) -> impl Iterator<Item = usize> + '_ {
-        self.priority_piece_ids
+    pub(crate) fn iter_queued_pieces<'a>(
+        &'a self,
+        file_priorities: &'a FilePriorities,
+        file_infos: &'a FileInfos,
+    ) -> impl Iterator<Item = ValidPieceIndex> + 'a {
+        file_priorities
             .iter()
-            .copied()
-            .filter(move |piece_id| self.queue_pieces[*piece_id])
-            .chain(
-                self.queue_pieces
-                    .iter_ones()
-                    .filter(move |id| !self.priority_piece_ids.contains(id)),
-            )
+            .filter_map(|p| Some((*p, file_infos.get(*p)?)))
+            .filter(|(id, f)| self.per_file_bytes[*id] != f.len)
+            .flat_map(|(_id, f)| f.iter_piece_priorities())
+            .filter(|id| self.queue_pieces[*id])
+            .filter_map(|id| id.try_into().ok())
+            .filter_map(|id| self.lengths.validate_piece_index(id))
+    }
+
+    pub(crate) fn is_piece_have(&self, id: ValidPieceIndex) -> bool {
+        self.have[id.get() as usize]
     }
 
     // None if wrong chunk
@@ -238,7 +250,7 @@ impl ChunkTracker {
         {
             return;
         }
-        debug!("remarking piece={} as broken", index);
+        debug!("marking piece={} as broken", index);
         self.queue_pieces.set(index.get() as usize, true);
         if let Some(s) = self.chunk_status.get_mut(self.lengths.chunk_range(index)) {
             s.fill(false);
@@ -279,7 +291,7 @@ impl ChunkTracker {
         let chunk_info = self.lengths.chunk_info_from_received_data(
             self.lengths.validate_piece_index(piece.index)?,
             piece.begin,
-            piece.block.as_ref().len() as u32,
+            piece.block.as_ref().len().try_into().unwrap(),
         )?;
         let chunk_range = self.lengths.chunk_range(chunk_info.piece_index);
         let chunk_range = self.chunk_status.get_mut(chunk_range).unwrap();
@@ -331,7 +343,7 @@ impl ChunkTracker {
                     anyhow::bail!("bug: shift = 0, this shouldn't have happened")
                 }
                 remaining_file_len -= shift;
-                current_piece_remaining -= shift as u32;
+                current_piece_remaining -= TryInto::<u32>::try_into(shift)?;
 
                 if current_piece_remaining == 0 {
                     let current_piece_have = self.have[current_piece.piece_index.get() as usize];
@@ -380,6 +392,41 @@ impl ChunkTracker {
         self.hns = res;
         Ok(res)
     }
+
+    pub(crate) fn get_selected_pieces(&self) -> &BF {
+        &self.selected
+    }
+
+    pub fn is_file_finished(&self, file_info: &FileInfo) -> bool {
+        self.have
+            .get(file_info.piece_range_usize())
+            .map(|r| r.all())
+            .unwrap_or(true)
+    }
+
+    pub(crate) fn is_finished(&self) -> bool {
+        self.get_hns().finished()
+    }
+
+    pub fn per_file_have_bytes(&self) -> &[u64] {
+        &self.per_file_bytes
+    }
+
+    // Returns remaining bytes
+    pub fn update_file_have_on_piece_completed(
+        &mut self,
+        piece_id: ValidPieceIndex,
+        file_id: usize,
+        file_info: &FileInfo,
+    ) -> u64 {
+        let diff_have = self.lengths.size_of_piece_in_file(
+            piece_id.get(),
+            file_info.offset_in_torrent,
+            file_info.len,
+        );
+        self.per_file_bytes[file_id] += diff_have;
+        file_info.len.saturating_sub(self.per_file_bytes[file_id])
+    }
 }
 
 #[cfg(test)]
@@ -408,13 +455,13 @@ mod tests {
             have_pieces.set(0, false);
 
             let chunks = compute_chunk_have_status(&l, &have_pieces).unwrap();
-            assert_eq!(chunks[0], false);
-            assert_eq!(chunks[1], false);
-            assert_eq!(chunks[2], false);
-            assert_eq!(chunks[3], true);
-            assert_eq!(chunks[4], true);
-            assert_eq!(chunks[5], true);
-            assert_eq!(chunks[6], true);
+            assert!(!chunks[0]);
+            assert!(!chunks[1]);
+            assert!(!chunks[2]);
+            assert!(chunks[3]);
+            assert!(chunks[4]);
+            assert!(chunks[5]);
+            assert!(chunks[6]);
         }
 
         {
@@ -424,13 +471,13 @@ mod tests {
 
             let chunks = compute_chunk_have_status(&l, &have_pieces).unwrap();
             dbg!(&chunks);
-            assert_eq!(chunks[0], true);
-            assert_eq!(chunks[1], true);
-            assert_eq!(chunks[2], true);
-            assert_eq!(chunks[3], false);
-            assert_eq!(chunks[4], false);
-            assert_eq!(chunks[5], false);
-            assert_eq!(chunks[6], true);
+            assert!(chunks[0]);
+            assert!(chunks[1]);
+            assert!(chunks[2]);
+            assert!(!chunks[3]);
+            assert!(!chunks[4]);
+            assert!(!chunks[5]);
+            assert!(chunks[6]);
         }
 
         {
@@ -440,13 +487,13 @@ mod tests {
 
             let chunks = compute_chunk_have_status(&l, &have_pieces).unwrap();
             dbg!(&chunks);
-            assert_eq!(chunks[0], true);
-            assert_eq!(chunks[1], true);
-            assert_eq!(chunks[2], true);
-            assert_eq!(chunks[3], true);
-            assert_eq!(chunks[4], true);
-            assert_eq!(chunks[5], true);
-            assert_eq!(chunks[6], false);
+            assert!(chunks[0]);
+            assert!(chunks[1]);
+            assert!(chunks[2]);
+            assert!(chunks[3]);
+            assert!(chunks[4]);
+            assert!(chunks[5]);
+            assert!(!chunks[6]);
         }
 
         {
@@ -466,11 +513,11 @@ mod tests {
 
                 let chunks = compute_chunk_have_status(&l, &have_pieces).unwrap();
                 dbg!(&chunks);
-                assert_eq!(chunks[0], true);
-                assert_eq!(chunks[1], true);
-                assert_eq!(chunks[2], false);
-                assert_eq!(chunks[3], false);
-                assert_eq!(chunks[4], true);
+                assert!(chunks[0]);
+                assert!(chunks[1]);
+                assert!(!chunks[2]);
+                assert!(!chunks[3]);
+                assert!(chunks[4]);
             }
 
             {
@@ -481,11 +528,11 @@ mod tests {
 
                 let chunks = compute_chunk_have_status(&l, &have_pieces).unwrap();
                 dbg!(&chunks);
-                assert_eq!(chunks[0], true);
-                assert_eq!(chunks[1], true);
-                assert_eq!(chunks[2], true);
-                assert_eq!(chunks[3], true);
-                assert_eq!(chunks[4], false);
+                assert!(chunks[0]);
+                assert!(chunks[1]);
+                assert!(chunks[2]);
+                assert!(chunks[3]);
+                assert!(!chunks[4]);
             }
         }
     }
@@ -510,7 +557,13 @@ mod tests {
         let initial_selected = BF::from_boxed_slice(vec![u8::MAX; bf_len].into_boxed_slice());
 
         // Initially, we need all files and all pieces.
-        let mut ct = ChunkTracker::new(initial_have.clone(), initial_selected.clone(), l).unwrap();
+        let mut ct = ChunkTracker::new(
+            initial_have.clone(),
+            initial_selected.clone(),
+            l,
+            &Default::default(),
+        )
+        .unwrap();
 
         // Select all file, no changes.
         assert_eq!(
@@ -536,9 +589,9 @@ mod tests {
                 needed_bytes: all_files[0],
             }
         );
-        assert_eq!(ct.queue_pieces[0], true);
-        assert_eq!(ct.queue_pieces[1], false);
-        assert_eq!(ct.queue_pieces[2], false);
+        assert!(ct.queue_pieces[0]);
+        assert!(!ct.queue_pieces[1]);
+        assert!(!ct.queue_pieces[2]);
 
         // Select only the second file.
         assert_eq!(
@@ -550,9 +603,9 @@ mod tests {
                 needed_bytes: piece_len as u64,
             }
         );
-        assert_eq!(ct.queue_pieces[0], false);
-        assert_eq!(ct.queue_pieces[1], true);
-        assert_eq!(ct.queue_pieces[2], false);
+        assert!(!ct.queue_pieces[0]);
+        assert!(ct.queue_pieces[1]);
+        assert!(!ct.queue_pieces[2]);
 
         // Select only the third file (zero sized one!).
         assert_eq!(
@@ -564,9 +617,9 @@ mod tests {
                 needed_bytes: 0,
             }
         );
-        assert_eq!(ct.queue_pieces[0], false);
-        assert_eq!(ct.queue_pieces[1], false);
-        assert_eq!(ct.queue_pieces[2], false);
+        assert!(!ct.queue_pieces[0]);
+        assert!(!ct.queue_pieces[1]);
+        assert!(!ct.queue_pieces[2]);
 
         // Select only the fourth file.
         assert_eq!(
@@ -578,13 +631,13 @@ mod tests {
                 needed_bytes: (piece_len + 1) as u64,
             }
         );
-        assert_eq!(ct.queue_pieces[0], false);
-        assert_eq!(ct.queue_pieces[1], true);
-        assert_eq!(ct.queue_pieces[2], true);
+        assert!(!ct.queue_pieces[0]);
+        assert!(ct.queue_pieces[1]);
+        assert!(ct.queue_pieces[2]);
 
         // Select first and last file
         assert_eq!(
-            ct.update_only_files(all_files.clone(), &HashSet::from_iter([0, 3]))
+            ct.update_only_files(all_files, &HashSet::from_iter([0, 3]))
                 .unwrap(),
             HaveNeededSelected {
                 have_bytes: 0,
@@ -592,13 +645,13 @@ mod tests {
                 needed_bytes: all_files[0] + all_files[3] + 1,
             }
         );
-        assert_eq!(ct.queue_pieces[0], true);
-        assert_eq!(ct.queue_pieces[1], true);
-        assert_eq!(ct.queue_pieces[2], true);
+        assert!(ct.queue_pieces[0]);
+        assert!(ct.queue_pieces[1]);
+        assert!(ct.queue_pieces[2]);
 
         // Select all files
         assert_eq!(
-            ct.update_only_files(all_files.clone(), &HashSet::from_iter([0, 1, 2, 3]))
+            ct.update_only_files(all_files, &HashSet::from_iter([0, 1, 2, 3]))
                 .unwrap(),
             HaveNeededSelected {
                 have_bytes: 0,
@@ -606,8 +659,8 @@ mod tests {
                 needed_bytes: total_len
             }
         );
-        assert_eq!(ct.queue_pieces[0], true);
-        assert_eq!(ct.queue_pieces[1], true);
-        assert_eq!(ct.queue_pieces[2], true);
+        assert!(ct.queue_pieces[0]);
+        assert!(ct.queue_pieces[1]);
+        assert!(ct.queue_pieces[2]);
     }
 }

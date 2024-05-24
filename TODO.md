@@ -4,7 +4,7 @@
 - [x] use some concurrent hashmap e.g. flurry or dashmap
 - [x] tracing instead of logging. Debugging peers: RUST_LOG=[{peer=.*}]=debug
       test-log for tests
-- [x] reopen read only is bugged
+- [x] (reopen) read only is bugged
 - [x] initializing/checking
   - [x] blocks the whole process. Need to break it up. On slower devices (rpi) just hangs for a good while
   - [x] checking torrents should be visible right away
@@ -89,3 +89,13 @@ refactor:
 - [x] don't account for stolen pieces in mesuring speed
 - [ ] file priority
 - [ ] start/end priority pieces per selected file, not per torrent
+
+Streaming:
+
+- [x] I want to stream files even if they are not checkboxed.
+
+Other:
+
+- [ ] keepalive is useless, the tieout is 120s, and read timeout is 10s. Need to send keepalive only if nothing was done recently.
+- [x] url should have the filename
+- [ ] reopening files: get rid of it!!! Even on Windows it should be alright - no need to reopen them.

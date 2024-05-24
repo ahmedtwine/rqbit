@@ -2,10 +2,10 @@ pub mod initializing;
 pub mod live;
 pub mod paused;
 pub mod stats;
+mod streaming;
 pub mod utils;
 
 use std::collections::HashSet;
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -25,6 +25,7 @@ use librqbit_core::torrent_metainfo::TorrentMetaV1Info;
 pub use live::*;
 use parking_lot::RwLock;
 
+use tokio::sync::Notify;
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -33,14 +34,19 @@ use tracing::error_span;
 use tracing::warn;
 
 use crate::chunk_tracker::ChunkTracker;
+use crate::file_info::FileInfo;
 use crate::spawn_utils::BlockingSpawner;
+use crate::storage::BoxStorageFactory;
 use crate::torrent_state::stats::LiveStats;
+use crate::type_aliases::DiskWorkQueueSender;
+use crate::type_aliases::FileInfos;
 use crate::type_aliases::PeerStream;
 
 use initializing::TorrentStateInitializing;
 
 use self::paused::TorrentStatePaused;
 pub use self::stats::{TorrentStats, TorrentStatsState};
+pub use self::streaming::FileStream;
 
 pub enum ManagedTorrentState {
     Initializing(Arc<TorrentStateInitializing>),
@@ -53,6 +59,16 @@ pub enum ManagedTorrentState {
 }
 
 impl ManagedTorrentState {
+    pub fn name(&self) -> &'static str {
+        match self {
+            ManagedTorrentState::Initializing(_) => "initializing",
+            ManagedTorrentState::Paused(_) => "paused",
+            ManagedTorrentState::Live(_) => "live",
+            ManagedTorrentState::Error(_) => "error",
+            ManagedTorrentState::None => "<invalid: none>",
+        }
+    }
+
     fn assert_paused(self) -> TorrentStatePaused {
         match self {
             Self::Paused(paused) => paused,
@@ -75,23 +91,28 @@ pub(crate) struct ManagedTorrentOptions {
     pub force_tracker_interval: Option<Duration>,
     pub peer_connect_timeout: Option<Duration>,
     pub peer_read_write_timeout: Option<Duration>,
-    pub overwrite: bool,
+    pub allow_overwrite: bool,
+    pub output_folder: PathBuf,
+    pub disk_write_queue: Option<DiskWorkQueueSender>,
 }
 
 pub struct ManagedTorrentInfo {
     pub info: TorrentMetaV1Info<ByteBufOwned>,
     pub info_hash: Id20,
-    pub out_dir: PathBuf,
     pub(crate) spawner: BlockingSpawner,
     pub trackers: HashSet<String>,
     pub peer_id: Id20,
     pub lengths: Lengths,
+    pub file_infos: FileInfos,
     pub span: tracing::Span,
     pub(crate) options: ManagedTorrentOptions,
 }
 
 pub struct ManagedTorrent {
     pub info: Arc<ManagedTorrentInfo>,
+    pub(crate) storage_factory: BoxStorageFactory,
+
+    state_change_notify: Notify,
     locked: RwLock<ManagedTorrentLocked>,
 }
 
@@ -164,6 +185,8 @@ impl ManagedTorrent {
             }
             _ => {}
         };
+
+        self.state_change_notify.notify_waiters();
 
         g.state = ManagedTorrentState::Error(error)
     }
@@ -252,7 +275,7 @@ impl ManagedTorrent {
                     error_span!(parent: span.clone(), "initialize_and_start"),
                     token.clone(),
                     async move {
-                        match init.check().await {
+                        match init.check(&t.storage_factory).await {
                             Ok(paused) => {
                                 let mut g = t.locked.write();
                                 if let ManagedTorrentState::Initializing(_) = &g.state {
@@ -263,6 +286,7 @@ impl ManagedTorrent {
 
                                 if start_paused {
                                     g.state = ManagedTorrentState::Paused(paused);
+                                    t.state_change_notify.notify_waiters();
                                     return Ok(());
                                 }
 
@@ -270,6 +294,7 @@ impl ManagedTorrent {
                                 let live =
                                     TorrentStateLive::new(paused, tx, live_cancellation_token)?;
                                 g.state = ManagedTorrentState::Live(live.clone());
+                                t.state_change_notify.notify_waiters();
 
                                 spawn_fatal_errors_receiver(&t, rx, token);
                                 spawn_peer_adder(&live, peer_rx);
@@ -279,6 +304,7 @@ impl ManagedTorrent {
                             Err(err) => {
                                 let result = anyhow::anyhow!("{:?}", err);
                                 t.locked.write().state = ManagedTorrentState::Error(err);
+                                t.state_change_notify.notify_waiters();
                                 Err(result)
                             }
                         }
@@ -301,6 +327,7 @@ impl ManagedTorrent {
                     g.only_files.clone(),
                 ));
                 g.state = ManagedTorrentState::Initializing(initializing.clone());
+                self.state_change_notify.notify_waiters();
                 drop(g);
 
                 // Recurse.
@@ -317,6 +344,7 @@ impl ManagedTorrent {
             ManagedTorrentState::Live(live) => {
                 let paused = live.pause()?;
                 g.state = ManagedTorrentState::Paused(paused);
+                self.state_change_notify.notify_waiters();
                 Ok(())
             }
             ManagedTorrentState::Initializing(_) => {
@@ -358,11 +386,7 @@ impl ManagedTorrent {
                     resp.total_bytes = hns.total();
                     resp.progress_bytes = hns.progress();
                     resp.finished = hns.finished();
-                    resp.file_progress = p
-                        .files
-                        .iter()
-                        .map(|f| f.have.load(Ordering::Relaxed))
-                        .collect();
+                    resp.file_progress = p.chunk_tracker.per_file_have_bytes().to_owned();
                 }
                 ManagedTorrentState::Live(l) => {
                     resp.state = S::Live;
@@ -372,7 +396,12 @@ impl ManagedTorrent {
                     resp.progress_bytes = hns.progress();
                     resp.finished = hns.finished();
                     resp.uploaded_bytes = l.get_uploaded_bytes();
-                    resp.file_progress = l.get_file_progress();
+                    resp.file_progress = l
+                        .lock_read("file_progress")
+                        .get_chunks()
+                        .ok()
+                        .map(|c| c.per_file_have_bytes().to_owned())
+                        .unwrap_or_default();
                     resp.live = Some(live_stats);
                 }
                 ManagedTorrentState::Error(e) => {
@@ -386,6 +415,26 @@ impl ManagedTorrent {
             }
             resp
         })
+    }
+
+    #[inline(never)]
+    pub fn wait_until_initialized(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        async move {
+            // TODO: rewrite, this polling is horrible
+            loop {
+                let done = self.with_state(|s| match s {
+                    ManagedTorrentState::Initializing(_) => Ok(false),
+                    ManagedTorrentState::Error(e) => bail!("{:?}", e),
+                    ManagedTorrentState::None => bail!("bug: torrent state is None"),
+                    _ => Ok(true),
+                })?;
+                if done {
+                    return Ok(());
+                }
+                let _ = timeout(Duration::from_secs(1), self.state_change_notify.notified()).await;
+            }
+        }
+        .boxed()
     }
 
     #[inline(never)]
@@ -404,7 +453,7 @@ impl ManagedTorrent {
                 if let Some(live) = live {
                     break live;
                 }
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                let _ = timeout(Duration::from_secs(1), self.state_change_notify.notified()).await;
             };
 
             live.wait_until_completed().await;
@@ -445,30 +494,32 @@ impl ManagedTorrent {
     }
 }
 
-pub struct ManagedTorrentBuilder {
+pub(crate) struct ManagedTorrentBuilder {
     info: TorrentMetaV1Info<ByteBufOwned>,
-    info_hash: Id20,
     output_folder: PathBuf,
+    info_hash: Id20,
     force_tracker_interval: Option<Duration>,
     peer_connect_timeout: Option<Duration>,
     peer_read_write_timeout: Option<Duration>,
     only_files: Option<Vec<usize>>,
     trackers: Vec<String>,
     peer_id: Option<Id20>,
-    overwrite: bool,
     spawner: Option<BlockingSpawner>,
+    allow_overwrite: bool,
+    storage_factory: BoxStorageFactory,
+    disk_writer: Option<DiskWorkQueueSender>,
 }
 
 impl ManagedTorrentBuilder {
-    pub fn new<P: AsRef<Path>>(
+    pub fn new(
         info: TorrentMetaV1Info<ByteBufOwned>,
         info_hash: Id20,
-        output_folder: P,
+        output_folder: PathBuf,
+        storage_factory: BoxStorageFactory,
     ) -> Self {
         Self {
             info,
             info_hash,
-            output_folder: output_folder.as_ref().into(),
             spawner: None,
             force_tracker_interval: None,
             peer_connect_timeout: None,
@@ -476,7 +527,10 @@ impl ManagedTorrentBuilder {
             only_files: None,
             trackers: Default::default(),
             peer_id: None,
-            overwrite: false,
+            allow_overwrite: false,
+            output_folder,
+            storage_factory,
+            disk_writer: None,
         }
     }
 
@@ -490,23 +544,23 @@ impl ManagedTorrentBuilder {
         self
     }
 
-    pub fn overwrite(&mut self, overwrite: bool) -> &mut Self {
-        self.overwrite = overwrite;
-        self
-    }
-
     pub fn force_tracker_interval(&mut self, force_tracker_interval: Duration) -> &mut Self {
         self.force_tracker_interval = Some(force_tracker_interval);
         self
     }
 
-    pub(crate) fn spawner(&mut self, spawner: BlockingSpawner) -> &mut Self {
+    pub fn spawner(&mut self, spawner: BlockingSpawner) -> &mut Self {
         self.spawner = Some(spawner);
         self
     }
 
     pub fn peer_id(&mut self, peer_id: Id20) -> &mut Self {
         self.peer_id = Some(peer_id);
+        self
+    }
+
+    pub fn allow_overwrite(&mut self, value: bool) -> &mut Self {
+        self.allow_overwrite = value;
         self
     }
 
@@ -520,13 +574,31 @@ impl ManagedTorrentBuilder {
         self
     }
 
+    pub fn disk_writer(&mut self, value: DiskWorkQueueSender) -> &mut Self {
+        self.disk_writer = Some(value);
+        self
+    }
+
     pub fn build(self, span: tracing::Span) -> anyhow::Result<ManagedTorrentHandle> {
         let lengths = Lengths::from_torrent(&self.info)?;
+        let file_infos = self
+            .info
+            .iter_file_details(&lengths)?
+            .map(|fd| {
+                Ok::<_, anyhow::Error>(FileInfo {
+                    relative_filename: fd.filename.to_pathbuf()?,
+                    offset_in_torrent: fd.offset,
+                    piece_range: fd.pieces,
+                    len: fd.len,
+                })
+            })
+            .collect::<anyhow::Result<Vec<FileInfo>>>()?;
+
         let info = Arc::new(ManagedTorrentInfo {
             span,
+            file_infos,
             info: self.info,
             info_hash: self.info_hash,
-            out_dir: self.output_folder,
             trackers: self.trackers.into_iter().collect(),
             spawner: self.spawner.unwrap_or_default(),
             peer_id: self.peer_id.unwrap_or_else(generate_peer_id),
@@ -535,9 +607,12 @@ impl ManagedTorrentBuilder {
                 force_tracker_interval: self.force_tracker_interval,
                 peer_connect_timeout: self.peer_connect_timeout,
                 peer_read_write_timeout: self.peer_read_write_timeout,
-                overwrite: self.overwrite,
+                allow_overwrite: self.allow_overwrite,
+                output_folder: self.output_folder,
+                disk_write_queue: self.disk_writer,
             },
         });
+
         let initializing = Arc::new(TorrentStateInitializing::new(
             info.clone(),
             self.only_files.clone(),
@@ -547,6 +622,8 @@ impl ManagedTorrentBuilder {
                 state: ManagedTorrentState::Initializing(initializing),
                 only_files: self.only_files,
             }),
+            state_change_notify: Notify::new(),
+            storage_factory: self.storage_factory,
             info,
         }))
     }

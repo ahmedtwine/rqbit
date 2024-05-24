@@ -1,6 +1,6 @@
 [package]
 name = "librqbit"
-version = "5.6.0"
+version = "6.0.0-beta.2"
 authors = ["Igor Katson <igor.katson@gmail.com>"]
 edition = "2021"
 description = "The main library used by rqbit torrent client. The binary is just a small wrapper on top of it."
@@ -17,14 +17,16 @@ webui = []
 timed_existence = []
 default-tls = ["reqwest/default-tls"]
 rust-tls = ["reqwest/rustls-tls"]
+storage_middleware = ["lru"]
+storage_examples = []
 
 [dependencies]
 bencode = { path = "../bencode", default-features = false, package = "librqbit-bencode", version = "2.2.2" }
 tracker_comms = { path = "../tracker_comms", default-features = false, package = "librqbit-tracker-comms", version = "1.0.2" }
 buffers = { path = "../buffers", package = "librqbit-buffers", version = "3.0.0" }
-librqbit-core = { path = "../librqbit_core", version = "3.7.0" }
+librqbit-core = { path = "../librqbit_core", version = "3.8.0" }
 clone_to_owned = { path = "../clone_to_owned", package = "librqbit-clone-to-owned", version = "2.2.1" }
-peer_binary_protocol = { path = "../peer_binary_protocol", package = "librqbit-peer-protocol", version = "3.5.2" }
+peer_binary_protocol = { path = "../peer_binary_protocol", package = "librqbit-peer-protocol", version = "3.5.3" }
 sha1w = { path = "../sha1w", default-features = false, package = "librqbit-sha1-wrapper", version = "3.0.0" }
 dht = { path = "../dht", package = "librqbit-dht", version = "5.0.3" }
 librqbit-upnp = { path = "../upnp", version = "0.1.0" }
@@ -58,7 +60,6 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
     "fmt",
     "env-filter",
 ] }
-
 uuid = { version = "1.2", features = ["v4"] }
 futures = "0.3"
 url = "2"
@@ -71,6 +72,8 @@ tokio-util = "0.7.10"
 bytes = "1.5.0"
 rlimit = "0.10.1"
 async-stream = "0.3.5"
+memmap2 = { version = "0.9.4" }
+lru = { version = "0.12.3", optional = true }
 
 [dev-dependencies]
 futures = { version = "0.3" }

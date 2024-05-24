@@ -1,5 +1,4 @@
 use std::{
-    fs::{File, OpenOptions},
     sync::{atomic::AtomicU64, Arc},
     time::Instant,
 };
@@ -10,15 +9,12 @@ use size_format::SizeFormatterBinary as SF;
 use tracing::{debug, info, warn};
 
 use crate::{
-    chunk_tracker::ChunkTracker, file_ops::FileOps, opened_file::OpenedFile,
-    type_aliases::OpenedFiles,
+    chunk_tracker::ChunkTracker,
+    file_ops::FileOps,
+    storage::{BoxStorageFactory, StorageFactory},
 };
 
 use super::{paused::TorrentStatePaused, ManagedTorrentInfo};
-
-fn ensure_file_length(file: &File, length: u64) -> anyhow::Result<()> {
-    Ok(file.set_len(length)?)
-}
 
 pub struct TorrentStateInitializing {
     pub(crate) meta: Arc<ManagedTorrentInfo>,
@@ -40,53 +36,20 @@ impl TorrentStateInitializing {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    pub async fn check(&self) -> anyhow::Result<TorrentStatePaused> {
-        let mut files = OpenedFiles::new();
-        for file_details in self.meta.info.iter_file_details(&self.meta.lengths)? {
-            let mut full_path = self.meta.out_dir.clone();
-            let relative_path = file_details
-                .filename
-                .to_pathbuf()
-                .context("error converting file to path")?;
-            full_path.push(relative_path);
-
-            std::fs::create_dir_all(full_path.parent().context("bug: no parent")?)?;
-            let file = if self.meta.options.overwrite {
-                OpenOptions::new()
-                    .create(true)
-                    .read(true)
-                    .write(true)
-                    .open(&full_path)
-                    .with_context(|| format!("error opening {full_path:?} in read/write mode"))?
-            } else {
-                // TODO: create_new does not seem to work with read(true), so calling this twice.
-                OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .open(&full_path)
-                    .with_context(|| format!("error creating {:?}", &full_path))?;
-                OpenOptions::new().read(true).write(true).open(&full_path)?
-            };
-            files.push(OpenedFile::new(
-                file,
-                full_path,
-                0,
-                file_details.len,
-                file_details.offset,
-                file_details.pieces,
-            ));
-        }
-
-        debug!("computed lengths: {:?}", &self.meta.lengths);
-
+    pub async fn check(
+        &self,
+        storage_factory: &BoxStorageFactory,
+    ) -> anyhow::Result<TorrentStatePaused> {
+        let files = storage_factory.init_storage(&self.meta)?;
         info!("Doing initial checksum validation, this might take a while...");
         let initial_check_results = self.meta.spawner.spawn_block_in_place(|| {
-            FileOps::new(&self.meta.info, &files, &self.meta.lengths).initial_check(
-                self.only_files.as_deref(),
-                &files,
+            FileOps::new(
+                &self.meta.info,
+                &*files,
+                &self.meta.file_infos,
                 &self.meta.lengths,
-                &self.checked_bytes,
             )
+            .initial_check(self.only_files.as_deref(), &self.checked_bytes)
         })?;
 
         info!(
@@ -98,7 +61,7 @@ impl TorrentStateInitializing {
 
         // Ensure file lenghts are correct, and reopen read-only.
         self.meta.spawner.spawn_block_in_place(|| {
-            for (idx, file) in files.iter().enumerate() {
+            for (idx, fi) in self.meta.file_infos.iter().enumerate() {
                 if self
                     .only_files
                     .as_ref()
@@ -106,22 +69,20 @@ impl TorrentStateInitializing {
                     .unwrap_or(true)
                 {
                     let now = Instant::now();
-                    if let Err(err) = ensure_file_length(&file.file.lock(), file.len) {
+                    if let Err(err) = files.ensure_file_length(idx, fi.len) {
                         warn!(
                             "Error setting length for file {:?} to {}: {:#?}",
-                            file.filename, file.len, err
+                            fi.relative_filename, fi.len, err
                         );
                     } else {
                         debug!(
                             "Set length for file {:?} to {} in {:?}",
-                            file.filename,
-                            SF::new(file.len),
+                            fi.relative_filename,
+                            SF::new(fi.len),
                             now.elapsed()
                         );
                     }
                 }
-
-                file.reopen(true)?;
             }
             Ok::<_, anyhow::Error>(())
         })?;
@@ -130,6 +91,7 @@ impl TorrentStateInitializing {
             initial_check_results.have_pieces,
             initial_check_results.selected_pieces,
             self.meta.lengths,
+            &self.meta.file_infos,
         )
         .context("error creating chunk tracker")?;
 
@@ -137,6 +99,7 @@ impl TorrentStateInitializing {
             info: self.meta.clone(),
             files,
             chunk_tracker,
+            streams: Arc::new(Default::default()),
         };
         Ok(paused)
     }
