@@ -1,5 +1,7 @@
 use super::s3_client;
 use lava_torrent::torrent::v1::TorrentBuilder;
+use librqbit::storage::filesystem::{FilesystemStorageFactory, MmapFilesystemStorageFactory};
+use librqbit::storage::{StorageFactory, StorageFactoryExt};
 use librqbit::{torrent_from_bytes, ByteBufOwned, TorrentMetaV1};
 use librqbit::{
     torrent_state::ManagedTorrentBuilder, AddTorrent, AddTorrentOptions, AddTorrentResponse,
@@ -72,6 +74,27 @@ impl CdnClient {
             }),
             listen_port_range: None,
             enable_upnp_port_forwarding: true,
+            defer_writes_up_to: Some(10), // Provide a value for defer_writes_up_to
+            default_storage_factory: Some({
+                fn wrap<S: StorageFactory + Clone>(s: S) -> impl StorageFactory {
+                    #[cfg(feature = "debug_slow_disk")]
+                    {
+                        use librqbit::storage::middleware::{
+                            slow::SlowStorageFactory, timing::TimingStorageFactory,
+                        };
+                        TimingStorageFactory::new("hdd".to_owned(), SlowStorageFactory::new(s))
+                    }
+                    #[cfg(not(feature = "debug_slow_disk"))]
+                    s
+                }
+                wrap(FilesystemStorageFactory::default()).boxed()
+
+                // if opts.experimental_mmap_storage {
+                //     wrap(MmapFilesystemStorageFactory::default()).boxed()
+                // } else {
+                //     wrap(FilesystemStorageFactory::default()).boxed()
+                // }
+            }),
         };
 
         // Create a new session with the specified options
@@ -109,10 +132,16 @@ impl CdnClient {
                 let torrent_id =
                     Id20::from_str("00000fffffffffffffffffffffffffffffffffff").unwrap(); // Replace with actual torrent ID
 
-                // Create a new ManagedTorrentBuilder with the torrent info and output directory
-                let mut builder =
-                    ManagedTorrentBuilder::new(torrent.info, torrent_id, &self.out_dir);
-                builder.overwrite(true);
+                // Create a new FilesystemStorageFactory
+                let storage_factory = FilesystemStorageFactory::default().boxed();
+
+                // Use the storage factory when creating the ManagedTorrentBuilder
+                let mut builder = ManagedTorrentBuilder::new(
+                    torrent.info,
+                    torrent_id,
+                    self.out_dir.clone(),
+                    storage_factory,
+                );
 
                 // Build the ManagedTorrent instance
                 let torrent = builder.build(Span::current())?;
@@ -142,8 +171,13 @@ impl CdnClient {
 
         // Fetch the content using BitTorrent
         let torrent_id = Id20::from_str("00000fffffffffffffffffffffffffffffffffff").unwrap(); // Replace with actual torrent ID
-        let mut builder = ManagedTorrentBuilder::new(torrent.info, torrent_id, &self.out_dir);
-        builder.overwrite(true);
+        let storage_factory = FilesystemStorageFactory::default().boxed();
+        let mut builder = ManagedTorrentBuilder::new(
+            torrent.info,
+            torrent_id,
+            self.out_dir.clone(),
+            storage_factory,
+        );
         let torrent = builder.build(Span::current())?;
 
         self.fetch_content_from_torrent(torrent).await?;

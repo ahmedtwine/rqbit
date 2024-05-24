@@ -494,7 +494,7 @@ impl ManagedTorrent {
     }
 }
 
-pub(crate) struct ManagedTorrentBuilder {
+pub struct ManagedTorrentBuilder {
     info: TorrentMetaV1Info<ByteBufOwned>,
     output_folder: PathBuf,
     info_hash: Id20,
